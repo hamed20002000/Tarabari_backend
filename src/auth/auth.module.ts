@@ -9,10 +9,8 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { UserModule } from 'src/application/services/user/appModuls/user.module';
 import { GoogleStrategy } from './strategy/google.strategy';
 import { UserService } from 'src/application/services/user/user.service';
-import { EmailService } from 'src/application/services/helper/email-service';
-import { AppleAuthService } from 'src/application/services/helper/apple-atuh.service';
 import { HttpModule, HttpService } from '@nestjs/axios';
-import { ImageService } from 'src/application/services/helper/image.service';
+import { PasswordService } from 'src/application/services/agent/services/password.service';
 
 
 
@@ -31,7 +29,7 @@ import { ImageService } from 'src/application/services/helper/image.service';
       imports: [ConfigModule],  // Import ConfigModule to access environment variables
       useFactory: async (configService: ConfigService) => ({
         secret: configService.get<string>('JWT_SECRET_KEY','ad;,pwqdpoqwkdopkwqopdqwpdkqwd65165dw1q5d1wqd;wq,dqwdASDwqd'),  // Retrieve the secret from environment variables
-        signOptions: { expiresIn: configService.get<string>('JWT_EXPIRATION_TIME','64800s') },  // Retrieve expiration time from environment variables
+        signOptions: { expiresIn: configService.get<number>('JWT_EXPIRATION_TIME',64800) },  // Retrieve expiration time from environment variables
       }),
       inject: [ConfigService],  // Inject ConfigService
     }),
@@ -39,8 +37,8 @@ import { ImageService } from 'src/application/services/helper/image.service';
     forwardRef(() => UserModule),
     
   ],
-  providers: [AuthService,ImageService, JwtStrategy,GoogleStrategy,UserService,EmailService,AppleAuthService],  // No need to manually inject UserRepository anymore
+  providers: [AuthService, JwtStrategy,GoogleStrategy,UserService,PasswordService],  // No need to manually inject UserRepository anymore
   controllers: [AuthController],
-  exports: [AuthService,AppleAuthService],
+  exports: [AuthService],
 })
 export class AuthModule {}

@@ -152,3 +152,18 @@ export type PendingGeneratorType={
     resumeIndex: number;
     remainingSegments: string[];
 }
+
+export enum MonitoredChatType {
+  GROUP = 'group',
+  CHANNEL = 'channel',
+}
+
+// NEW: هر رکورد می‌تونه منبع (ازش پیام می‌خونیم)، مقصد (بهش پیام
+// پردازش‌شده می‌فرستیم)، یا هر دو باشه. این باعث می‌شه هم منابع (گروه‌های
+// بار) و هم مقصدها (گروه/کانال‌هایی که خروجی رو می‌فرستیم) در یه جدول
+// واحد و با یه فرم افزودن یکسان (لینک) مدیریت بشن.
+export enum MonitoredChannelRole {
+  SOURCE = 'source',
+  DESTINATION = 'destination',
+  BOTH = 'both',
+}
