@@ -30,6 +30,11 @@ const execAsync = promisify(exec);
 const DEFAULT_SESSION_ID = 'main';
 const CHANNEL_REPLACEMENT_NUMBER = '09394113259'; // بهتره از config/env بیاد
 
+// NEW: شماره‌ی شخصی که علاوه بر گروه/کانال‌های مقصد، پیام‌های پردازش‌شده
+// (سفارش‌های بار تشخیص‌داده‌شده) مستقیماً بهش هم فرستاده می‌شن. از .env
+// خونده می‌شه -- اگه خالی باشه، این قابلیت به‌سادگی غیرفعال می‌مونه.
+const PERSONAL_NOTIFY_NUMBER = process.env.WHATSAPP_PERSONAL_NOTIFY_NUMBER || '';
+
 @Injectable()
 export class WhatsappService implements OnModuleInit {
   private readonly logger = new Logger(WhatsappService.name);
@@ -43,7 +48,6 @@ export class WhatsappService implements OnModuleInit {
   >();
 
   private static readonly SELECTION_PAGE_SIZE = 10;
-  private pendingTranscriptions = new Map<string, string>();
 
   // NEW: صف پیام‌های گروه/کانال که هنوز پردازش نشدن. چون رویداد
   // 'messages.upsert' می‌تونه چند بار پشت‌سرهم (حتی هم‌زمان) فایر بشه،
@@ -68,6 +72,11 @@ export class WhatsappService implements OnModuleInit {
   // بی‌وقفه دوباره امتحان کنه.
   private static readonly BACKOFF_BASE_MINUTES = 5;
   private static readonly BACKOFF_MAX_MINUTES = 60;
+
+  // NEW: بعد از اتصال، اگه PERSONAL_NOTIFY_NUMBER تنظیم شده باشه، JID
+  // تاییدشده‌اش اینجا کش می‌شه -- تا لازم نباشه هر بار دوباره onWhatsApp
+  // صدا زده بشه.
+  private personalNotifyJid: string | null = null;
 
   constructor(
     @InjectRepository(WhatsappAuthCredential)
@@ -134,6 +143,20 @@ export class WhatsappService implements OnModuleInit {
         void this.sock.updateProfileName('باربری تارابری').catch((err) =>
           this.logger.error('پروفایل نیم تنظیم نشد', err),
         );
+
+        // NEW: اگه شماره‌ی شخصی در .env تنظیم شده، همین‌جا (یک‌بار بعد از
+        // هر اتصال موفق) تاییدش می‌کنیم و JID واقعی‌ش رو کش می‌کنیم.
+        if (PERSONAL_NOTIFY_NUMBER) {
+          this.resolvePersonalContact(PERSONAL_NOTIFY_NUMBER)
+            .then((jid) => {
+              this.personalNotifyJid = jid;
+              this.logger.log(`Kişisel bildirim numarası doğrulandı: ${jid}`);
+            })
+            .catch((err) =>
+              this.logger.error('Kişisel bildirim numarası doğrulanamadı', err as Error),
+            );
+        }
+
         void this.syncMonitoredChannels();
       }
     });
@@ -321,6 +344,50 @@ export class WhatsappService implements OnModuleInit {
         );
       }
     }
+  }
+
+  /**
+   * یه شماره تلفن شخصی رو می‌گیره، تایید می‌کنه که واقعاً روی واتساپ فعاله
+   * (با متد onWhatsApp خود Baileys)، و JID واقعی‌ش رو برمی‌گردونه. برخلاف
+   * گروه/کانال، هیچ عملیات join/follow واقعی لازم نیست -- فقط باید مطمئن
+   * بشیم می‌شه بهش پیام فرستاد.
+   */
+  private async resolvePersonalContact(identifier: string): Promise<string> {
+    if (!this.sock) throw new Error('WhatsApp soketi hazır değil.');
+
+    // اگه از قبل یه JID کامل باشه (نه فقط شماره)، مستقیم استفاده می‌کنیم.
+    if (identifier.endsWith('@s.whatsapp.net')) {
+      return identifier;
+    }
+
+    // فقط رقم‌ها رو نگه می‌داریم و فرمت رو به استاندارد بین‌المللی (بدون
+    // صفر ابتدایی، با کد کشور) تبدیل می‌کنیم -- مثلاً ۰۹۱۴۱۹۴۴۷۸۴ ->
+    // 989141944784. این تبدیل فرض می‌کنه شماره ایرانیه؛ اگه شماره از قبل
+    // با کد کشور (98...) وارد شده باشه، دست‌نخورده می‌مونه.
+    //
+    // نکته‌ی مهم: عبارت \D در جاوااسکریپت فقط ارقام انگلیسی (0-9) رو
+    // "رقم" می‌شناسه -- ارقام فارسی/عربی (۰-۹ و ٠-٩) رو "غیررقم" در نظر
+    // می‌گیره و اگه قبل از replace(/\D/g, '') تبدیلشون نکنیم، کل رشته حذف
+    // می‌شه و یه شماره‌ی خالی/نامعتبر می‌مونه. برای همین اول این تبدیل رو
+    // انجام می‌دیم.
+    let digits = identifier
+      .replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString())
+      .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+      .replace(/\D/g, '');
+    if (digits.startsWith('0')) {
+      digits = '98' + digits.slice(1);
+    } else if (!digits.startsWith('98')) {
+      digits = '98' + digits;
+    }
+
+    // onWhatsApp چک می‌کنه این شماره واقعاً روی واتساپ ثبت‌نامه یا نه --
+    // بدون این چک، ممکنه بعداً هنگام sendMessage با خطای مبهم مواجه بشیم.
+    const results = await this.sock.onWhatsApp(digits);
+    if (!results || results.length === 0 || !results[0].exists) {
+      throw new Error(`Numara WhatsApp'ta kayıtlı değil: ${identifier}`);
+    }
+
+    return results[0].jid ?? `${digits}@s.whatsapp.net`;
   }
 
   /**
@@ -546,6 +613,27 @@ export class WhatsappService implements OnModuleInit {
       record.confidence = extraction.confidence;
       record.foundPhoneNumbers = extraction.found_phone_numbers;
 
+      // NEW (تستی): به هر شماره‌ای که از متن خام استخراج شده، یه پیام
+      // تستی می‌فرستیم -- فقط برای بررسی اینکه resolvePersonalContact و
+      // sendMessage درست کار می‌کنن. بعداً باید این رو با متن واقعی
+      // (یا شرط دقیق‌تر) جایگزین کرد.
+      if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
+        for (const rawNumber of extraction.found_phone_numbers) {
+          try {
+            const customerJid = await this.resolvePersonalContact(rawNumber);
+            await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
+            this.logger.log(
+              `📤 Test mesajı gönderildi: ${rawNumber} -> ${customerJid}`,
+            );
+          } catch (testError) {
+            this.logger.error(
+              `Test mesajı gönderilemedi: ${rawNumber}`,
+              testError as Error,
+            );
+          }
+        }
+      }
+
       if (extraction.is_cargo_order) {
         // NEW: کد پیگیری از همون orderNumber ای که در save اولیه تولید شد
         // ساخته می‌شه -- مشتری فقط همین کد رو تلفنی می‌گه.
@@ -563,6 +651,24 @@ export class WhatsappService implements OnModuleInit {
 
         if (processedText) {
           await this.forwardToAllDestinations(processedText, channelJid);
+        }
+
+        // NEW: برخلاف مقصدهای دیتابیس (که متن پردازش‌شده/ساختاریافته رو
+        // می‌گیرن)، به شماره‌ی شخصی همون متن خام اصلی + فقط کد پیگیری
+        // فرستاده می‌شه -- نه قالب کامل (بار/مسیر/قیمت/...).
+        if (this.personalNotifyJid) {
+          const personalNotifyText = `${text}\n\nکد پیگیری: ${orderCode}`;
+          try {
+            await this.sendMessage(this.personalNotifyJid, personalNotifyText);
+            this.logger.log(
+              `📤 Kişisel bildirim gönderildi: [${channelJid}] -> [${this.personalNotifyJid}]`,
+            );
+          } catch (personalError) {
+            this.logger.error(
+              `Kişisel bildirim gönderilemedi: [${channelJid}] -> [${this.personalNotifyJid}]`,
+              personalError as Error,
+            );
+          }
         }
       } else {
         record.processedText = null;
@@ -637,11 +743,6 @@ export class WhatsappService implements OnModuleInit {
     }
 
     const { userid, username } = mapping;
-
-    if (this.pendingTranscriptions.has(jid)) {
-      await this.handleTranscriptionReply(jid, text, userid, username);
-      return;
-    }
 
     if (this.pendingSelections.has(jid)) {
       await this.handleSelectionReply(jid, text);
@@ -847,52 +948,6 @@ export class WhatsappService implements OnModuleInit {
       this.logger.error(`Dosya işleme hatası: ${jid}`, error as Error);
       await this.sendMessage(jid, 'Dosya işlenirken bir hata oluştu.');
     }
-  }
-
-  private async handleTranscriptionReply(
-    jid: string,
-    text: string,
-    userid: string,
-    username: string,
-  ): Promise<void> {
-    const pendingText = this.pendingTranscriptions.get(jid);
-    if (!pendingText) return;
-
-    const choice = this.parseUserSelectionReply(text);
-
-    if (choice === 1) {
-      this.pendingTranscriptions.delete(jid);
-      await this.sendMessage(jid, `✅ Onaylandı: "${pendingText}"`);
-      await this.runCommand(userid, username, pendingText);
-      return;
-    }
-
-    if (choice === 2) {
-      this.pendingTranscriptions.delete(jid);
-      await this.sendMessage(jid, '❌ İptal edildi. Lütfen tekrar deneyin.');
-      return;
-    }
-
-    await this.sendMessage(jid, `Lütfen 1 (Evet) veya 2 (Hayır) yazın.`);
-  }
-
-  private async handleDeleteConfirmationReply(
-    jid: string,
-    text: string,
-    userid: string,
-  ): Promise<void> {
-    const choice = this.parseUserSelectionReply(text);
-
-    if (choice === 2 || this.isCancelReply(text)) {
-      await this.sendMessage(jid, '❌ İşlem iptal edildi.');
-      return;
-    }
-
-    if (choice === 1) {
-      return;
-    }
-
-    await this.sendMessage(jid, `Lütfen onaylamak için 1, iptal için 2 yazın.`);
   }
 
   private async resolveUserFromJid(
