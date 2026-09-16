@@ -347,6 +347,33 @@ export class WhatsappService implements OnModuleInit {
   }
 
   /**
+   * تشخیص می‌ده یه شماره احتمالاً موبایله یا ثابت -- بدون فراخوانی هیچ API
+   * واتساپی (فقط بر اساس الگوی رقم‌ها). شماره‌ی موبایل ایران همیشه (بعد از
+   * حذف صفر ابتدایی یا کد کشور 98) با رقم ۹ شروع می‌شه و ۱۰ رقم داره.
+   * شماره‌ی ثابت هیچ‌وقت اینو نداره (کد شهرهاش با ۹ شروع نمی‌شه).
+   *
+   * چرا این چک لازمه: شماره‌ی ثابت اصلاً روی واتساپ ثبت‌نام نمی‌شه، پس
+   * چک کردنش با onWhatsApp هم بی‌فایده‌ست هم یه درخواست غیرضروری به
+   * سرورهای واتساپه -- درخواست‌های غیرضروری زیاد می‌تونه ریسک محدود شدن
+   * حساب رو بالا ببره.
+   */
+  private isLikelyMobileNumber(rawNumber: string): boolean {
+    const normalized = rawNumber
+      .replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d).toString())
+      .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d).toString())
+      .replace(/\D/g, '');
+
+    let core = normalized;
+    if (core.startsWith('98')) {
+      core = core.slice(2);
+    } else if (core.startsWith('0')) {
+      core = core.slice(1);
+    }
+
+    return core.length === 10 && core.startsWith('9');
+  }
+
+  /**
    * یه شماره تلفن شخصی رو می‌گیره، تایید می‌کنه که واقعاً روی واتساپ فعاله
    * (با متد onWhatsApp خود Baileys)، و JID واقعی‌ش رو برمی‌گردونه. برخلاف
    * گروه/کانال، هیچ عملیات join/follow واقعی لازم نیست -- فقط باید مطمئن
@@ -619,6 +646,15 @@ export class WhatsappService implements OnModuleInit {
       // (یا شرط دقیق‌تر) جایگزین کرد.
       if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
         for (const rawNumber of extraction.found_phone_numbers) {
+          // NEW: قبل از هر درخواستی به واتساپ، چک می‌کنیم این شماره اصلاً
+          // احتمال داره موبایل باشه یا نه -- شماره‌ی ثابت هیچ‌وقت روی
+          // واتساپ نیست، پس چک کردنش هم بی‌فایده‌ست هم یه درخواست اضافه‌ی
+          // بی‌دلیل به سرورهای واتساپه.
+          if (!this.isLikelyMobileNumber(rawNumber)) {
+            this.logger.log(`⏭️ Sabit hat olduğu için atlandı: ${rawNumber}`);
+            continue;
+          }
+
           try {
             const customerJid = await this.resolvePersonalContact(rawNumber);
             await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
