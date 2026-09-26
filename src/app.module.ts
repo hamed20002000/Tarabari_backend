@@ -19,8 +19,12 @@ import { WhatsappUserMapping } from './application/services/agent/entities/Whats
 // TypeORM اصلاً این جدول‌ها رو نمی‌شناسه، حتی برای کوئری زدن.
 import { WhatsappChannelMessage } from './application/services/agent/entities/WhatsappChannelMessage';
 import { MonitoredChannel } from './application/services/agent/entities/MonitoredChannel';
+import { OutboxEvent } from './application/services/agent/entities/OutboxEvent';
+import { CandidateListing } from './application/services/agent/entities/CandinateList';
+import { CargoSubscription } from './application/services/agent/entities/CargoSubscription';
 // NEW: ماژول کنترلر پنل مدیر برای افزودن/حذف گروه و کانال
 import { BaseinfoModule } from './application/services/agent/appModule/base.module';
+import { OutboxModule } from './application/services/agent/appModule/outbox.module';
 import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
@@ -68,6 +72,9 @@ import { ScheduleModule } from '@nestjs/schedule';
           WhatsappUserMapping,
           WhatsappChannelMessage, // NEW
           MonitoredChannel, // NEW
+          OutboxEvent,
+          CandidateListing,
+          CargoSubscription,
         ],
         migrations: ['domain/migrations/*.ts'],
         migrationsRun: false,
@@ -92,6 +99,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     UserModule,
     WhatsappModule,
     BaseinfoModule, // NEW
+    OutboxModule,
   ],
 })
 export class AppModule {}

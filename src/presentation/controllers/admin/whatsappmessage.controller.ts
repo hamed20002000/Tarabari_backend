@@ -8,6 +8,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { WhatsappChannelMessage } from 'src/application/services/agent/entities/WhatsappChannelMessage';
+import { CandidateListing } from 'src/application/services/agent/entities/CandinateList';
 
 // کد پیگیری به فرم "TRB-00042" ساخته می‌شه (همون الگویی که در
 // WhatsappService.buildProcessedText استفاده شده) -- این هلپر برای اضافه
@@ -37,7 +38,7 @@ export class WhatsappMessageController {
    * لیست پیام‌ها با فیلتر و صفحه‌بندی.
    *
    * پارامترهای Query:
-   *   - search: جستجو در متن خام و متن پردازش‌شده (rawText / processedText)
+   *   - search: جستجو در متن خام پیام (rawText)
    *   - code: جستجوی دقیق با کد پیگیری (مثلاً "TRB-00042" یا فقط "42")
    *   - isCargoOrder: فیلتر بر اساس تشخیص سفارش بار ("true" یا "false")
    *   - channelJid: فیلتر بر اساس گروه/کانال مبدا خاص
@@ -55,7 +56,16 @@ export class WhatsappMessageController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    const qb = this.messageRepo.createQueryBuilder('msg');
+    // کد پیگیری حالا مال CandidateListing هست (نه خود پیام) -- برای همین
+    // کاندید متناظر هر پیام (در صورت وجود) join می‌شه.
+    const qb = this.messageRepo
+      .createQueryBuilder('msg')
+      .leftJoinAndMapOne(
+        'msg.candidate',
+        CandidateListing,
+        'candidate',
+        'candidate.rawMessageId = CAST(msg.id AS varchar)',
+      );
 
     // جستجو با کد پیگیری -- اولویت با این فیلتره، چون معمولاً دقیق‌ترین
     // راه پیدا کردن یه پیام مشخصه (مثلاً وقتی مشتری تلفنی کد رو می‌گه).
@@ -65,17 +75,12 @@ export class WhatsappMessageController {
         // کد کاملاً نامعتبره (هیچ رقمی توش نیست) -- مطمئناً نتیجه‌ای نداره.
         return { items: [], total: 0, page: 1, limit: 20 };
       }
-      qb.andWhere('msg.orderNumber = :orderNumber', { orderNumber });
+      qb.andWhere('candidate.orderNumber = :orderNumber', { orderNumber });
     }
 
-    // جستجو در محتوا -- هم متن خام (پیامی که از گروه/کانال دریافت شده) و
-    // هم متن پردازش‌شده (چیزی که فوروارد شده) رو پوشش می‌ده، چون کاربر
-    // ممکنه دنبال کلمه‌ای بگرده که فقط در یکی از این دو باشه.
+    // جستجو در متن خام پیامی که از گروه/کانال دریافت شده.
     if (search?.trim()) {
-      qb.andWhere(
-        '(msg.rawText ILIKE :search OR msg.processedText ILIKE :search)',
-        { search: `%${search.trim()}%` },
-      );
+      qb.andWhere('msg.rawText ILIKE :search', { search: `%${search.trim()}%` });
     }
 
     if (isCargoOrder !== undefined) {
@@ -99,10 +104,7 @@ export class WhatsappMessageController {
     const [items, total] = await qb.getManyAndCount();
 
     return {
-      items: items.map((item) => ({
-        ...item,
-        orderCode: toOrderCode(item.orderNumber),
-      })),
+      items: items.map((item) => this.withOrderCode(item)),
       total,
       page: pageNum,
       limit: limitNum,
@@ -114,10 +116,29 @@ export class WhatsappMessageController {
    */
   @Get(':id')
   async findOne(@Param('id') id: string) {
-    const item = await this.messageRepo.findOne({ where: { id } });
+    const item = await this.messageRepo
+      .createQueryBuilder('msg')
+      .leftJoinAndMapOne(
+        'msg.candidate',
+        CandidateListing,
+        'candidate',
+        'candidate.rawMessageId = CAST(msg.id AS varchar)',
+      )
+      .where('msg.id = :id', { id })
+      .getOne();
     if (!item) {
       throw new NotFoundException('پیام مورد نظر یافت نشد.');
     }
-    return { ...item, orderCode: toOrderCode(item.orderNumber) };
+    return this.withOrderCode(item);
+  }
+
+  // پیام‌هایی که سفارش بار نیستن کاندید ندارن -- orderCode براشون null هست.
+  private withOrderCode(item: WhatsappChannelMessage) {
+    const candidate = (item as WhatsappChannelMessage & { candidate?: CandidateListing })
+      .candidate;
+    return {
+      ...item,
+      orderCode: candidate ? toOrderCode(candidate.orderNumber) : null,
+    };
   }
 }

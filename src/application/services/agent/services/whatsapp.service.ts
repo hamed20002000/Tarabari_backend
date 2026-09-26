@@ -387,8 +387,8 @@ export class WhatsappService implements OnModuleInit {
 
   /**
    * پردازش کامل یک پیام جدید از گروه یا کانال: استخراج متن، تشخیص سفارش
-   * بار، ذخیره در دیتابیس، و NEW -- انتشار یه event (candidate.created) از
-   * طریق Outbox Pattern برای اینکه سرویس اصلی هم باخبر بشه.
+   * بار، ذخیره در دیتابیس، و برای سفارش بار -- انتشار یه event
+   * (cargo.message.detected) از طریق Outbox Pattern برای توزیع‌کننده.
    */
   private async handleChannelMessage(msg: WAMessage): Promise<void> {
     const channelJid = msg.key.remoteJid!;
@@ -433,51 +433,49 @@ export class WhatsappService implements OnModuleInit {
       record.confidence = extraction.confidence;
       record.foundPhoneNumbers = extraction.found_phone_numbers;
 
-      if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
-        for (const rawNumber of extraction.found_phone_numbers) {
-          if (!this.isLikelyMobileNumber(rawNumber)) {
-            this.logger.log(`⏭️ Sabit hat olduğu için atlandı: ${rawNumber}`);
-            continue;
-          }
+      // فعلاً غیرفعال -- در این مرحله به صاحب بار/شماره‌های داخل پیام چیزی
+      // فرستاده نمی‌شه. بعداً با متن واقعی جایگزین می‌شه.
+      // if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
+        // for (const rawNumber of extraction.found_phone_numbers) {
+          // if (!this.isLikelyMobileNumber(rawNumber)) {
+            // this.logger.log(`⏭️ Sabit hat olduğu için atlandı: ${rawNumber}`);
+            // continue;
+          // }
 
-          try {
-            const customerJid = await this.resolvePersonalContact(rawNumber);
-            await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
-            this.logger.log(
-              `📤 Test mesajı gönderildi: ${rawNumber} -> ${customerJid}`,
-            );
-          } catch (testError) {
-            this.logger.error(
-              `Test mesajı gönderilemedi: ${rawNumber}`,
-              testError as Error,
-            );
-          }
-        }
-      }
+          // try {
+            // const customerJid = await this.resolvePersonalContact(rawNumber);
+            // await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
+            // this.logger.log(
+              // `📤 Test mesajı gönderildi: ${rawNumber} -> ${customerJid}`,
+            // );
+          // } catch (testError) {
+            // this.logger.error(
+              // `Test mesajı gönderilemedi: ${rawNumber}`,
+              // testError as Error,
+            // );
+          // }
+        // }
+      // }
 
       if (extraction.is_cargo_order) {
-        const orderCode = `TRB-${record.orderNumber.toString().padStart(5, '0')}`;
-
         const processedText = this.buildProcessedText(
           extraction,
           CHANNEL_REPLACEMENT_NUMBER,
-          orderCode,
         );
-        record.processedText = processedText;
 
-        // NEW: ذخیره‌ی نهایی رکورد + ثبت رکورد outbox، هر دو در یه
-        // تراکنش واحد -- یا هر دو موفق می‌شن، یا هیچ‌کدوم. این تضمین
-        // می‌کنه که اگه سرور درست بین این دو عملیات کرش کنه، هیچ‌وقت یه
-        // پیام "نیمه‌ثبت‌شده" (بدون event متناظرش) نداشته باشیم.
+        // ذخیره‌ی رکورد پیام + ثبت رکورد outbox در یه تراکنش واحد -- یا هر
+        // دو انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
+        // توزیع‌کننده (برنامه‌ی دیگه) هست که این event رو مصرف می‌کنه.
         await this.dataSource.transaction(async (manager) => {
           await manager.save(WhatsappChannelMessage, record);
 
           await manager.insert(OutboxEvent, {
-            eventType: 'candidate.created',
+            eventType: 'cargo.message.detected',
             payload: {
-              candidateId: record.id,
-              orderCode,
+              messageId: record.id,
               channelJid,
+              rawText: text,
+              receivedAt: record.receivedAt,
               origin: extraction.origin,
               destination: extraction.destination,
               cargoType: extraction.cargo_type,
@@ -490,28 +488,22 @@ export class WhatsappService implements OnModuleInit {
           });
         });
 
-        this.logger.log(`✅ Kargo siparişi tespit edildi [${channelJid}] -- kod: ${orderCode}`);
+        this.logger.log(`✅ Kargo siparişi tespit edildi [${channelJid}] [${record.id}]`);
 
-        if (processedText) {
-          await this.forwardToAllDestinations(processedText, channelJid);
-        }
-
-        if (this.personalNotifyJid) {
-          const personalNotifyText = `${text}\n\nکد پیگیری: ${orderCode}`;
-          try {
-            await this.sendMessage(this.personalNotifyJid, personalNotifyText);
-            this.logger.log(
-              `📤 Kişisel bildirim gönderildi: [${channelJid}] -> [${this.personalNotifyJid}]`,
-            );
-          } catch (personalError) {
-            this.logger.error(
-              `Kişisel bildirim gönderilemedi: [${channelJid}] -> [${this.personalNotifyJid}]`,
-              personalError as Error,
-            );
-          }
-        }
+        // if (this.personalNotifyJid) {
+        //   try {
+        //     await this.sendMessage(this.personalNotifyJid, text);
+        //     this.logger.log(
+        //       `📤 Kişisel bildirim gönderildi: [${channelJid}] -> [${this.personalNotifyJid}]`,
+        //     );
+        //   } catch (personalError) {
+        //     this.logger.error(
+        //       `Kişisel bildirim gönderilemedi: [${channelJid}] -> [${this.personalNotifyJid}]`,
+        //       personalError as Error,
+        //     );
+        //   }
+        // }
       } else {
-        record.processedText = null;
         await this.channelMessageRepo.save(record);
       }
     } catch (error) {

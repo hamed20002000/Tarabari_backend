@@ -11,8 +11,8 @@ export const typeOrmConfig = (configService: ConfigService): TypeOrmModuleOption
   password: configService.get<string>('DB_PASSWORD', '123qwe$%'),
   database: configService.get<string>('DB_DATABASE', 'SETASTAKIP'),
  /*  entities: ['src/domain/entities/*.ts'], */
-  entities: ['src/application/services/agent/entities/WhatsappChannelMessage.ts'],
-  migrations: ['src/infrastructure/database/migrations/1789405305302-add_OrderNumberـwhatsappchannelmessage.ts'],  
+  entities: ['src/application/services/agent/entities/CargoSubscription.ts'],
+  migrations: ['src/infrastructure/database/migrations/*-CreateCargoSubscription.ts'],  
   migrationsRun: false,   
   synchronize: false, // Disable auto schema synchronization
   logging:true// ['error'], // Log only errors

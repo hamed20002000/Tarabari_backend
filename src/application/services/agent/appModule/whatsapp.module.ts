@@ -10,6 +10,8 @@ import { AuthModule } from 'src/auth/auth.module';
 import { WhatsappChannelMessage } from '../entities/WhatsappChannelMessage';
 import { MonitoredChannel } from '../entities/MonitoredChannel';
 import { TransportOrderService } from '../services/aiTools.service';
+import { CargoSubscription } from '../entities/CargoSubscription';
+import { CargoSubscriptionService } from '../services/cargoSubscription.service';
 
 @Module({
   imports: [
@@ -18,13 +20,14 @@ import { TransportOrderService } from '../services/aiTools.service';
       WhatsappAuthKey,
       WhatsappUserMapping,
       WhatsappChannelMessage,
-      MonitoredChannel
+      MonitoredChannel,
+      CargoSubscription,
     ]),
     // forwardRef چون AgentGateway هم برعکس به WhatsappService نیاز داره
     forwardRef(() => AgentModule),
     AuthModule
   ],
-  providers: [WhatsappService,TransportOrderService],
+  providers: [WhatsappService,TransportOrderService,CargoSubscriptionService],
   exports: [WhatsappService],
 })
 export class WhatsappModule {}
