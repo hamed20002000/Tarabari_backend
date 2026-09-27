@@ -20,6 +20,7 @@
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "typeorm": "ts-node -r tsconfig-paths/register node_modules/typeorm/cli.js -d ./src/infrastructure/database/data-source.ts",
+    "telegram:login": "ts-node -r tsconfig-paths/register scripts/telegram-login.ts",
     "seed": "ts-node -r tsconfig-paths/register src/infrastructure/database/seeds/seed.ts"
   },
   "dependencies": {
@@ -81,6 +82,7 @@
     "socket.io": "^4.8.1",
     "speakeasy": "^2.0.0",
     "swagger-ui-express": "^5.0.1",
+    "telegram": "^2.26.22",
     "typeorm": "^0.3.20",
     "uuid": "^11.0.3",
     "winston": "^3.17.0",

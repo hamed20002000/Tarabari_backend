@@ -19,6 +19,9 @@ import { WhatsappUserMapping } from './application/services/agent/entities/Whats
 // TypeORM اصلاً این جدول‌ها رو نمی‌شناسه، حتی برای کوئری زدن.
 import { WhatsappChannelMessage } from './application/services/agent/entities/WhatsappChannelMessage';
 import { MonitoredChannel } from './application/services/agent/entities/MonitoredChannel';
+import { TelegramMonitoredChannel } from './application/services/agent/entities/TelegramMonitoredChannel';
+import { TelegramChannelMessage } from './application/services/agent/entities/TelegramChannelMessage';
+import { TelegramUserSession } from './application/services/agent/entities/TelegramUserSession';
 import { OutboxEvent } from './application/services/agent/entities/OutboxEvent';
 import { CandidateListing } from './application/services/agent/entities/CandinateList';
 import { CargoSubscription } from './application/services/agent/entities/CargoSubscription';
@@ -72,6 +75,9 @@ import { ScheduleModule } from '@nestjs/schedule';
           WhatsappUserMapping,
           WhatsappChannelMessage, // NEW
           MonitoredChannel, // NEW
+          TelegramMonitoredChannel,
+          TelegramChannelMessage,
+          TelegramUserSession,
           OutboxEvent,
           CandidateListing,
           CargoSubscription,

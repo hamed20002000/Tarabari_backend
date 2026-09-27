@@ -2,6 +2,8 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import axios from 'axios';
 import { z } from 'zod';
+import { Injectable } from '@nestjs/common';
+import { SerialTaskQueue } from '../common/serialTaskQueue';
 
 // ------------------------------------------------------------------
 // Schema خروجی خام مدل -- فقط فیلدهای استخراج‌شده، بدون متن نهایی.
@@ -31,7 +33,18 @@ type CargoExtraction = z.infer<typeof CargoExtractionSchema>;
 // ------------------------------------------------------------------
 export type CargoOrderExtraction = CargoExtraction;
 
+@Injectable()
 class TransportOrderService {
+  // صف سراسری فراخوانی مدل -- واتساپ و تلگرام هر دو از همین یک نمونه
+  // (CargoDetectionModule) استفاده می‌کنن، پس درخواست‌هاشون به Ollama
+  // پشت‌سرهم اجرا می‌شن، نه هم‌زمان (که باعث timeout می‌شد).
+  private readonly modelQueue = new SerialTaskQueue();
+
+  /** تعداد درخواست‌هایی که الان در صف مدل هستن (شامل درخواست در حال اجرا). */
+  get pendingCount(): number {
+    return this.modelQueue.pending;
+  }
+
   private readonly PROMPT_PATH = join(
     process.cwd(),
     'src/application/services/agent/prompts/selector.prompt',
@@ -50,10 +63,14 @@ class TransportOrderService {
     }
   }
 
-  async DetermineTextIsTransportOrder(
+  DetermineTextIsTransportOrder(
     prompt: string,
     replacementNumber: string = '09394113259',
   ): Promise<CargoOrderExtraction> {
+    return this.modelQueue.run(() => this.runDetection(prompt));
+  }
+
+  private async runDetection(prompt: string): Promise<CargoOrderExtraction> {
     const systemContent = this.loadSystemPrompt();
 
     const ollamaReq = {

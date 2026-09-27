@@ -1,9 +1,9 @@
 import { Column, Entity, PrimaryColumn, UpdateDateColumn } from 'typeorm';
 
 /**
- * Baileys'in AuthenticationCreds objesini saklar (JSON string olarak).
- * sessionId sabit bir değer olabilir (örn. 'main') ya da çoklu numara
- * desteği isterseniz her WhatsApp numarası için ayrı bir id olabilir.
+ * آبجکت AuthenticationCreds مربوط به Baileys رو (به‌صورت رشته‌ی JSON) نگه می‌داره.
+ * sessionId می‌تونه یک مقدار ثابت باشه (مثلاً 'main') یا اگه پشتیبانی از
+ * چند شماره بخواید، برای هر شماره‌ی واتساپ یک id جدا باشه.
  */
 @Entity('WhatsappAuthCredential')
 export class WhatsappAuthCredential {

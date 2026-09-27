@@ -31,7 +31,7 @@ async function bootstrap() {
   // هستن (retryAttempts در TypeORM هم به همین کمک می‌کنه).
   process.on('unhandledRejection', (reason) => {
     logger.error(
-      `Yakalanmamış Promise reddi: ${reason instanceof Error ? reason.stack : reason}`,
+      `Promise رد‌شده‌ی مدیریت‌نشده: ${reason instanceof Error ? reason.stack : reason}`,
     );
     // عمداً process.exit() اینجا نیست -- می‌خوایم سرور زنده بمونه.
   });
@@ -42,7 +42,7 @@ async function bootstrap() {
   // process manager (PM2/systemd/Docker restart policy) می‌سپاریم که
   // دوباره بالاش بیاره.
   process.on('uncaughtException', (error) => {
-    logger.error(`Yakalanmamış istisna: ${error.stack || error.message}`);
+    logger.error(`استثنای مدیریت‌نشده: ${error.stack || error.message}`);
     process.exit(1);
   });
 
@@ -79,7 +79,7 @@ async function bootstrap() {
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
 
   await app.listen(process.env.PORT ?? 3333);
-  logger.log(`Uygulama ${await app.getUrl()} adresinde çalışıyor`);
+  logger.log(`برنامه روی آدرس ${await app.getUrl()} در حال اجراست`);
 }
 bootstrap();
 //npm run typeorm migration:generate -n user_banner_image

@@ -1,10 +1,10 @@
 import { Column, Entity, PrimaryColumn, UpdateDateColumn } from 'typeorm';
 
 /**
- * Baileys'in signal key store'unu (pre-key, session, sender-key,
- * app-state-sync-key, app-state-sync-version...) key-value olarak saklar.
- * useMultiFileAuthState her key için ayrı bir dosya yazıyordu;
- * burada aynı mantık DB satırlarıyla karşılanıyor.
+ * signal key store مربوط به Baileys (pre-key, session, sender-key,
+ * app-state-sync-key, app-state-sync-version...) رو به‌صورت key-value نگه می‌داره.
+ * useMultiFileAuthState برای هر key یک فایل جدا می‌نوشت؛
+ * اینجا همون منطق با ردیف‌های دیتابیس پیاده شده.
  */
 @Entity('WhatsappAuthKey')
 export class WhatsappAuthKey {

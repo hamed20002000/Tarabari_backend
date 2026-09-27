@@ -7,12 +7,16 @@ import { AuthModule } from 'src/auth/auth.module';
 import { WhatsappService } from '../services/whatsapp.service';
 import { JwtService } from '@nestjs/jwt';
 import { WhatsappModule } from './whatsapp.module';
+import { TelegramChannelModule } from './telegramChannel.module';
+import { CargoDetectionModule } from './cargoDetection.module';
 
 @Module({
   imports: [
     forwardRef(() => UserModule),
     forwardRef(() => AuthModule),
     forwardRef(() => WhatsappModule),
+    TelegramChannelModule,
+    CargoDetectionModule,
   ],
 
   providers: [

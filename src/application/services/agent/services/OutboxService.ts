@@ -41,10 +41,10 @@ export class OutboxService {
         event.published = true;
         await this.outboxRepo.save(event);
 
-        this.logger.log(`📤 Event yayınlandı: ${event.eventType} [${event.id}]`);
+        this.logger.log(`📤 Event منتشر شد: ${event.eventType} [${event.id}]`);
       } catch (error) {
         this.logger.error(
-          `Event yayınlanamadı, tekrar denenecek: ${event.id}`,
+          `انتشار Event ناموفق بود، دوباره تلاش می‌شه: ${event.id}`,
           error as Error,
         );
       }

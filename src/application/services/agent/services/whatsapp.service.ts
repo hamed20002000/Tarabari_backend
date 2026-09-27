@@ -1,26 +1,29 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, Repository, IsNull, LessThanOrEqual, In, Not } from 'typeorm';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, IsNull, LessThanOrEqual, In, Not } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
 import makeWASocket, {
   DisconnectReason,
   WASocket,
   WAMessage,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import * as qrcode from 'qrcode-terminal';
 import { WhatsappAuthCredential } from '../entities/WhatsappAuthCredential';
 import { WhatsappAuthKey } from '../entities/WhatsappAuthKey';
 import { WhatsappChannelMessage } from '../entities/WhatsappChannelMessage';
-import { OutboxEvent } from '../entities/OutboxEvent';
 import { MonitoredChannel } from '../entities/MonitoredChannel';
 import { MonitoredChatType, MonitoredChannelRole } from '../types';
 import { useDbAuthState } from '../hooks/useDbAuthState';
-import { TransportOrderService, CargoOrderExtraction } from '../services/aiTools.service';
+import { SpeechToTextService } from './speechToText.service';
+import { CargoPipelineService } from './cargoPipeline.service';
+import { SerialTaskQueue } from '../common/serialTaskQueue';
+import { RecentIdCache } from '../common/recentIdCache';
+import { exponentialBackoffMinutes } from '../common/backoff';
 
 const DEFAULT_SESSION_ID = 'main';
-const CHANNEL_REPLACEMENT_NUMBER = '09394113259'; // بهتره از config/env بیاد
 
 // شماره‌ی شخصی که علاوه بر گروه/کانال‌های مقصد، پیام‌های پردازش‌شده
 // (سفارش‌های بار تشخیص‌داده‌شده) مستقیماً بهش هم فرستاده می‌شن. از .env
@@ -34,8 +37,12 @@ export class WhatsappService implements OnModuleInit {
 
   // صف پیام‌های گروه/کانال که هنوز پردازش نشدن -- جلوگیری از فرستادن
   // چند درخواست هم‌زمان به Ollama که باعث timeout می‌شد.
-  private channelMessageQueue: WAMessage[] = [];
-  private isProcessingChannelQueue = false;
+  private readonly messageQueue = new SerialTaskQueue();
+
+  // شناسه‌ی پیام‌هایی که اخیراً بررسی شدن -- چون فقط پیام‌های بار توی
+  // دیتابیس ذخیره می‌شن، این کش جلوی فرستادن دوباره‌ی پیام‌های غیربارِ
+  // تکراری (redelivery واتساپ) به مدل رو می‌گیره.
+  private readonly recentMessageIds = new RecentIdCache(1000);
 
   // فاصله بین درخواست‌های فالو/جوین پشت‌سرهم -- جلوگیری از الگوی burst
   // مشکوک وقتی چند گروه/کانال هم‌زمان در دیتابیس اضافه شدن.
@@ -58,10 +65,8 @@ export class WhatsappService implements OnModuleInit {
     private readonly channelMessageRepo: Repository<WhatsappChannelMessage>,
     @InjectRepository(MonitoredChannel)
     private readonly monitoredChannelRepo: Repository<MonitoredChannel>,
-    // NEW: برای نوشتن اتمیک رکورد پیام + رکورد outbox در یه تراکنش واحد
-    @InjectDataSource()
-    private readonly dataSource: DataSource,
-    private readonly transportOrderService: TransportOrderService,
+    private readonly cargoPipeline: CargoPipelineService,
+    private readonly speechToTextService: SpeechToTextService,
   ) { }
 
   async onModuleInit() {
@@ -76,7 +81,7 @@ export class WhatsappService implements OnModuleInit {
     );
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    this.logger.log(`Baileys sürümü: ${version.join('.')}, güncel mi: ${isLatest}`);
+    this.logger.log(`نسخه‌ی Baileys: ${version.join('.')}، آخرین نسخه‌ست: ${isLatest}`);
 
     this.sock = makeWASocket({
       auth: state,
@@ -97,15 +102,15 @@ export class WhatsappService implements OnModuleInit {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        this.logger.warn(`WhatsApp bağlantısı kesildi. Yeniden bağlanılacak mı: ${shouldReconnect}`);
+        this.logger.warn(`اتصال واتساپ قطع شد. اتصال مجدد انجام می‌شه: ${shouldReconnect}`);
 
         if (shouldReconnect) {
           this.connect();
         } else {
-          this.logger.error('Oturum kapatıldı (loggedOut). Yeni QR gerekiyor.');
+          this.logger.error('نشست بسته شد (loggedOut). QR جدید لازمه.');
         }
       } else if (connection === 'open') {
-        this.logger.log('WhatsApp bağlantısı kuruldu.');
+        this.logger.log('اتصال واتساپ برقرار شد.');
         void this.sock.updateProfileName('باربری تارابری').catch((err) =>
           this.logger.error('پروفایل نیم تنظیم نشد', err),
         );
@@ -114,10 +119,10 @@ export class WhatsappService implements OnModuleInit {
           this.resolvePersonalContact(PERSONAL_NOTIFY_NUMBER)
             .then((jid) => {
               this.personalNotifyJid = jid;
-              this.logger.log(`Kişisel bildirim numarası doğrulandı: ${jid}`);
+              this.logger.log(`شماره‌ی اعلان شخصی تایید شد: ${jid}`);
             })
             .catch((err) =>
-              this.logger.error('Kişisel bildirim numarası doğrulanamadı', err as Error),
+              this.logger.error('شماره‌ی اعلان شخصی تایید نشد', err as Error),
             );
         }
 
@@ -140,14 +145,14 @@ export class WhatsappService implements OnModuleInit {
 
       if (!wasRemoved) return;
 
-      this.logger.warn(`🚫 Bot gruptan çıkarıldı: ${groupJid}`);
+      this.logger.warn(`🚫 ربات از گروه حذف شد: ${groupJid}`);
 
       await this.monitoredChannelRepo.update(
         { resolvedJid: groupJid },
         {
           isActive: false,
           isFollowed: false,
-          lastError: 'Bot gruptan çıkarıldı (kicked/removed).',
+          lastError: 'ربات از گروه حذف شد (kicked/removed).',
         },
       );
     });
@@ -185,7 +190,7 @@ export class WhatsappService implements OnModuleInit {
 
     if (pendingChannels.length === 0) return;
 
-    this.logger.log(`${pendingChannels.length} yeni grup/kanal bulundu, işleniyor...`);
+    this.logger.log(`${pendingChannels.length} گروه/کانال جدید پیدا شد، در حال پردازش...`);
 
     for (const channel of pendingChannels) {
       try {
@@ -202,7 +207,7 @@ export class WhatsappService implements OnModuleInit {
         await this.monitoredChannelRepo.save(channel);
 
         this.logger.log(
-          `${channel.type === MonitoredChatType.GROUP ? 'Gruba katılındı' : 'Kanal takip edildi'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
+          `${channel.type === MonitoredChatType.GROUP ? 'به گروه پیوست' : 'کانال دنبال شد'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
         );
 
         await new Promise((resolve) =>
@@ -212,8 +217,9 @@ export class WhatsappService implements OnModuleInit {
         channel.lastError = (error as Error).message;
         channel.retryCount += 1;
 
-        const backoffMinutes = Math.min(
-          WhatsappService.BACKOFF_BASE_MINUTES * Math.pow(2, channel.retryCount - 1),
+        const backoffMinutes = exponentialBackoffMinutes(
+          channel.retryCount,
+          WhatsappService.BACKOFF_BASE_MINUTES,
           WhatsappService.BACKOFF_MAX_MINUTES,
         );
         channel.nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
@@ -221,7 +227,7 @@ export class WhatsappService implements OnModuleInit {
         await this.monitoredChannelRepo.save(channel);
 
         this.logger.error(
-          `İşlenemedi (${channel.type}): ${channel.identifier} -- ${backoffMinutes} dakika sonra tekrar denenecek (deneme #${channel.retryCount})`,
+          `پردازش نشد (${channel.type}): ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه دوباره تلاش می‌شه (تلاش #${channel.retryCount})`,
           error as Error,
         );
       }
@@ -245,7 +251,7 @@ export class WhatsappService implements OnModuleInit {
   }
 
   private async resolvePersonalContact(identifier: string): Promise<string> {
-    if (!this.sock) throw new Error('WhatsApp soketi hazır değil.');
+    if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
 
     if (identifier.endsWith('@s.whatsapp.net')) {
       return identifier;
@@ -264,14 +270,14 @@ export class WhatsappService implements OnModuleInit {
 
     const results = await this.sock.onWhatsApp(digits);
     if (!results || results.length === 0 || !results[0].exists) {
-      throw new Error(`Numara WhatsApp'ta kayıtlı değil: ${identifier}`);
+      throw new Error(`شماره در واتساپ ثبت نشده: ${identifier}`);
     }
 
     return results[0].jid ?? `${digits}@s.whatsapp.net`;
   }
 
   private async followChannel(identifier: string): Promise<string> {
-    if (!this.sock) throw new Error('WhatsApp soketi hazır değil.');
+    if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
 
     const metadata = identifier.endsWith('@newsletter')
       ? { id: identifier }
@@ -282,7 +288,7 @@ export class WhatsappService implements OnModuleInit {
   }
 
   private async joinGroup(identifier: string): Promise<string> {
-    if (!this.sock) throw new Error('WhatsApp soketi hazır değil.');
+    if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
 
     if (identifier.endsWith('@g.us')) {
       return identifier;
@@ -293,101 +299,32 @@ export class WhatsappService implements OnModuleInit {
 
       if (!result || typeof result !== 'string') {
         throw new Error(
-          'Gruba katılım isteği gönderildi fakat onay bekliyor olabilir (Admin Approval açık olabilir).',
+          'درخواست عضویت در گروه ارسال شد ولی ممکنه منتظر تایید باشه (احتمالاً Admin Approval فعاله).',
         );
       }
 
       return result;
     } catch (error) {
       this.logger.error(
-        `groupAcceptInvite ham hata detayı: ${JSON.stringify(error, Object.getOwnPropertyNames(error as object))}`,
+        `جزئیات خام خطای groupAcceptInvite: ${JSON.stringify(error, Object.getOwnPropertyNames(error as object))}`,
       );
 
       throw new Error(
-        `Gruba katılınamadı (muhtemelen Admin Approval açık): ${(error as Error).message}`,
+        `عضویت در گروه ناموفق بود (احتمالاً Admin Approval فعاله): ${(error as Error).message}`,
       );
     }
   }
 
+  // پیام‌ها یکی‌یکی پردازش می‌شن -- جلوگیری از درخواست‌های هم‌زمان به Ollama.
   private enqueueChannelMessage(msg: WAMessage): void {
-    this.channelMessageQueue.push(msg);
-    void this.processChannelQueue();
-  }
-
-  private async processChannelQueue(): Promise<void> {
-    if (this.isProcessingChannelQueue) return;
-    this.isProcessingChannelQueue = true;
-
-    try {
-      while (this.channelMessageQueue.length > 0) {
-        const msg = this.channelMessageQueue.shift()!;
-        try {
-          await this.handleChannelMessage(msg);
-        } catch (error) {
-          this.logger.error(
-            `Kanal/grup mesajı işlenirken hata: ${msg.key.remoteJid}`,
-            error as Error,
-          );
-        }
-      }
-    } finally {
-      this.isProcessingChannelQueue = false;
-    }
-  }
-
-  private buildProcessedText(
-    data: CargoOrderExtraction,
-    replacementNumber: string,
-    orderCode?: string,
-  ): string {
-    if (!data.is_cargo_order) {
-      return '';
-    }
-
-    const lines: string[] = [];
-
-    if (data.cargo_type) {
-      lines.push(`بار: ${data.cargo_type}`);
-    }
-
-    if (data.origin && data.destination) {
-      lines.push(`مسیر: ${data.origin} به ${data.destination}`);
-    } else if (data.origin) {
-      lines.push(`مبدا: ${data.origin}`);
-    } else if (data.destination) {
-      lines.push(`مقصد: ${data.destination}`);
-    }
-
-    if (data.weight) {
-      lines.push(`وزن: ${data.weight}`);
-    }
-
-    if (data.vehicle_type) {
-      lines.push(`نوع خودرو: ${data.vehicle_type}`);
-    }
-
-    if (data.price) {
-      lines.push(`قیمت: ${data.price}`);
-    }
-
-    const phoneRelatedPattern = /تلفن|تماس|شماره/;
-    if (data.extra_notes && !phoneRelatedPattern.test(data.extra_notes)) {
-      lines.push(data.extra_notes);
-    }
-
-    lines.push('');
-    lines.push(`شماره تماس: ${replacementNumber}`);
-
-    if (orderCode) {
-      lines.push(`کد پیگیری: ${orderCode}`);
-    }
-
-    return lines.join('\n');
+    void this.messageQueue.run(() => this.handleChannelMessage(msg)).catch((error) =>
+      this.logger.error(`خطا در پردازش پیام کانال/گروه: ${msg.key.remoteJid}`, error as Error),
+    );
   }
 
   /**
    * پردازش کامل یک پیام جدید از گروه یا کانال: استخراج متن، تشخیص سفارش
-   * بار، ذخیره در دیتابیس، و برای سفارش بار -- انتشار یه event
+   * بار، و فقط برای سفارش بار -- ذخیره در دیتابیس و انتشار یه event
    * (cargo.message.detected) از طریق Outbox Pattern برای توزیع‌کننده.
    */
   private async handleChannelMessage(msg: WAMessage): Promise<void> {
@@ -395,120 +332,81 @@ export class WhatsappService implements OnModuleInit {
     const messageId = msg.key.id;
 
     if (!messageId) return;
+    if (this.recentMessageIds.has(messageId)) return;
 
     const existing = await this.channelMessageRepo.findOne({ where: { messageId } });
     if (existing) return;
 
-    const text =
+    let text =
       msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+    const audio = msg.message?.audioMessage;
 
-    if (!text) return;
+    if (!text && !audio) return;
 
-    this.logger.log(`📩 Yeni mesaj [${channelJid}]: ${text.slice(0, 80)}...`);
+    this.recentMessageIds.add(messageId);
 
-    const record = this.channelMessageRepo.create({
-      channelJid,
-      messageId,
-      rawText: text,
+    // پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه.
+    const isVoice = !text && !!audio;
+    if (isVoice) {
+      text = await this.speechToTextService.transcribeVoice(
+        Number(audio!.seconds ?? 0),
+        () =>
+          downloadMediaMessage(msg, 'buffer', {}, {
+            reuploadRequest: this.sock!.updateMediaMessage,
+            logger: this.sock!.logger,
+          }),
+        `whatsapp ${channelJid} ${messageId}`,
+      );
+      if (!text) return;
+    }
+
+    const extraction = await this.cargoPipeline.process({
+      label: `${channelJid} ${messageId}`,
+      text,
+      isVoice,
+      entity: WhatsappChannelMessage,
+      record: { channelJid, messageId, isCargoOrder: true },
+      source: { platform: 'whatsapp', channelJid },
     });
-    await this.channelMessageRepo.save(record);
+    if (!extraction) return;
 
-    try {
-      const startedAt = Date.now();
-      this.logger.log(
-        `⏱️ Model çağrısı başlıyor [${channelJid}] [${messageId}] -- kuyrukta bekleyen: ${this.channelMessageQueue.length}`,
-      );
+    // فعلاً غیرفعال -- در این مرحله به صاحب بار/شماره‌های داخل پیام چیزی
+    // فرستاده نمی‌شه. بعداً با متن واقعی جایگزین می‌شه.
+    // if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
+      // for (const rawNumber of extraction.found_phone_numbers) {
+        // if (!this.isLikelyMobileNumber(rawNumber)) {
+          // this.logger.log(`⏭️ چون تلفن ثابته رد شد: ${rawNumber}`);
+          // continue;
+        // }
 
-      const extraction = await this.transportOrderService.DetermineTextIsTransportOrder(
-        text,
-        CHANNEL_REPLACEMENT_NUMBER,
-      );
-
-      const elapsedMs = Date.now() - startedAt;
-      this.logger.log(
-        `⏱️ Model çağrısı bitti [${channelJid}] [${messageId}] -- ${elapsedMs}ms sürdü`,
-      );
-
-      record.isCargoOrder = extraction.is_cargo_order;
-      record.confidence = extraction.confidence;
-      record.foundPhoneNumbers = extraction.found_phone_numbers;
-
-      // فعلاً غیرفعال -- در این مرحله به صاحب بار/شماره‌های داخل پیام چیزی
-      // فرستاده نمی‌شه. بعداً با متن واقعی جایگزین می‌شه.
-      // if (extraction.found_phone_numbers && extraction.found_phone_numbers.length > 0) {
-        // for (const rawNumber of extraction.found_phone_numbers) {
-          // if (!this.isLikelyMobileNumber(rawNumber)) {
-            // this.logger.log(`⏭️ Sabit hat olduğu için atlandı: ${rawNumber}`);
-            // continue;
-          // }
-
-          // try {
-            // const customerJid = await this.resolvePersonalContact(rawNumber);
-            // await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
-            // this.logger.log(
-              // `📤 Test mesajı gönderildi: ${rawNumber} -> ${customerJid}`,
-            // );
-          // } catch (testError) {
-            // this.logger.error(
-              // `Test mesajı gönderilemedi: ${rawNumber}`,
-              // testError as Error,
-            // );
-          // }
+        // try {
+          // const customerJid = await this.resolvePersonalContact(rawNumber);
+          // await this.sendMessage(customerJid, 'این یک پیام تستی از سیستم است.');
+          // this.logger.log(
+            // `📤 پیام تست ارسال شد: ${rawNumber} -> ${customerJid}`,
+          // );
+        // } catch (testError) {
+          // this.logger.error(
+            // `پیام تست ارسال نشد: ${rawNumber}`,
+            // testError as Error,
+          // );
         // }
       // }
+    // }
 
-      if (extraction.is_cargo_order) {
-        const processedText = this.buildProcessedText(
-          extraction,
-          CHANNEL_REPLACEMENT_NUMBER,
-        );
-
-        // ذخیره‌ی رکورد پیام + ثبت رکورد outbox در یه تراکنش واحد -- یا هر
-        // دو انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
-        // توزیع‌کننده (برنامه‌ی دیگه) هست که این event رو مصرف می‌کنه.
-        await this.dataSource.transaction(async (manager) => {
-          await manager.save(WhatsappChannelMessage, record);
-
-          await manager.insert(OutboxEvent, {
-            eventType: 'cargo.message.detected',
-            payload: {
-              messageId: record.id,
-              channelJid,
-              rawText: text,
-              receivedAt: record.receivedAt,
-              origin: extraction.origin,
-              destination: extraction.destination,
-              cargoType: extraction.cargo_type,
-              weight: extraction.weight,
-              vehicleType: extraction.vehicle_type,
-              price: extraction.price,
-              extraNotes: extraction.extra_notes,
-              processedText,
-            },
-          });
-        });
-
-        this.logger.log(`✅ Kargo siparişi tespit edildi [${channelJid}] [${record.id}]`);
-
-        // if (this.personalNotifyJid) {
-        //   try {
-        //     await this.sendMessage(this.personalNotifyJid, text);
-        //     this.logger.log(
-        //       `📤 Kişisel bildirim gönderildi: [${channelJid}] -> [${this.personalNotifyJid}]`,
-        //     );
-        //   } catch (personalError) {
-        //     this.logger.error(
-        //       `Kişisel bildirim gönderilemedi: [${channelJid}] -> [${this.personalNotifyJid}]`,
-        //       personalError as Error,
-        //     );
-        //   }
-        // }
-      } else {
-        await this.channelMessageRepo.save(record);
-      }
-    } catch (error) {
-      this.logger.error(`Mesaj analiz edilemedi: ${messageId}`, error as Error);
-    }
+    // if (extraction.is_cargo_order && this.personalNotifyJid) {
+    //   try {
+    //     await this.sendMessage(this.personalNotifyJid, text);
+    //     this.logger.log(
+    //       `📤 اعلان شخصی ارسال شد: [${channelJid}] -> [${this.personalNotifyJid}]`,
+    //     );
+    //   } catch (personalError) {
+    //     this.logger.error(
+    //       `اعلان شخصی ارسال نشد: [${channelJid}] -> [${this.personalNotifyJid}]`,
+    //       personalError as Error,
+    //     );
+    //   }
+    // }
   }
 
   private async forwardToAllDestinations(
@@ -532,12 +430,12 @@ export class WhatsappService implements OnModuleInit {
       try {
         await this.sendMessage(destination.resolvedJid, text);
         this.logger.log(
-          `📤 Mesaj iletildi: [${sourceJid}] -> [${destination.resolvedJid}] (${destination.label ?? destination.identifier})`,
+          `📤 پیام فوروارد شد: [${sourceJid}] -> [${destination.resolvedJid}] (${destination.label ?? destination.identifier})`,
         );
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (forwardError) {
         this.logger.error(
-          `Mesaj iletilemedi: [${sourceJid}] -> [${destination.resolvedJid}]`,
+          `فوروارد پیام ناموفق بود: [${sourceJid}] -> [${destination.resolvedJid}]`,
           forwardError as Error,
         );
       }
@@ -546,20 +444,20 @@ export class WhatsappService implements OnModuleInit {
 
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.sock) {
-      this.logger.error('WhatsApp soketi hazır değil.');
+      this.logger.error('سوکت واتساپ آماده نیست.');
       return;
     }
 
     const SEND_TIMEOUT_MS = 15000;
 
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error(`sendMessage zaman aşımı: ${jid}`)), SEND_TIMEOUT_MS);
+      setTimeout(() => reject(new Error(`مهلت sendMessage تموم شد: ${jid}`)), SEND_TIMEOUT_MS);
     });
 
     try {
       await Promise.race([this.sock.sendMessage(jid, { text }), timeoutPromise]);
     } catch (error) {
-      this.logger.error(`sendMessage başarısız: ${jid}`, error as Error);
+      this.logger.error(`sendMessage ناموفق بود: ${jid}`, error as Error);
     }
   }
 }
