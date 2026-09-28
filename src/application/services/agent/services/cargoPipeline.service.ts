@@ -3,7 +3,7 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource, DeepPartial, EntityTarget, ObjectLiteral } from 'typeorm';
 import { OutboxEvent } from '../entities/OutboxEvent';
 import { TransportOrderService, CargoOrderExtraction } from './aiTools.service';
-import { buildCargoProcessedText, CHANNEL_REPLACEMENT_NUMBER } from '../common/cargoText';
+import { buildCargoProcessedText } from '../common/cargoText';
 
 export interface CargoCandidate<T extends CargoMessageRecord> {
   /** برای لاگ‌ها، مثلاً شناسه‌ی گروه/کانال. */
@@ -16,7 +16,13 @@ export interface CargoCandidate<T extends CargoMessageRecord> {
   record: DeepPartial<T>;
   /** فیلدهای مخصوص پلتفرم که به payload رویداد outbox اضافه می‌شن. */
   source: Record<string, unknown>;
+  /**
+   * شناسه‌ی کاربرهای transport_backend که گروه/کانال مبدا رو ثبت کردن --
+   * اعلان و نمایش این بار فقط برای همین کاربرهاست.
+   */
+  ownerUserIds: string[];
 }
+
 
 export interface CargoMessageRecord extends ObjectLiteral {
   id: string;
@@ -52,10 +58,7 @@ export class CargoPipelineService {
         `⏱️ فراخوانی مدل شروع شد [${label}] -- در صف مدل: ${this.transportOrderService.pendingCount}`,
       );
 
-      const extraction = await this.transportOrderService.DetermineTextIsTransportOrder(
-        text,
-        CHANNEL_REPLACEMENT_NUMBER,
-      );
+      const extraction = await this.transportOrderService.DetermineTextIsTransportOrder(text);
 
       this.logger.log(`⏱️ فراخوانی مدل تموم شد [${label}] -- ${Date.now() - startedAt}ms طول کشید`);
 
@@ -72,10 +75,10 @@ export class CargoPipelineService {
   }
 
   private async saveCargo<T extends CargoMessageRecord>(
-    { label, text, isVoice, entity, record, source }: CargoCandidate<T>,
+    { label, text, isVoice, entity, record, source, ownerUserIds }: CargoCandidate<T>,
     extraction: CargoOrderExtraction,
   ): Promise<void> {
-    const processedText = buildCargoProcessedText(extraction, CHANNEL_REPLACEMENT_NUMBER);
+    const processedText = buildCargoProcessedText(extraction);
 
     // ذخیره‌ی رکورد پیام + ثبت رکورد outbox در یه تراکنش واحد -- یا هر دو
     // انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
@@ -107,6 +110,7 @@ export class CargoPipelineService {
           price: extraction.price,
           extraNotes: extraction.extra_notes,
           processedText,
+          ownerUserIds,
         },
       });
 

@@ -33,6 +33,6 @@ export class TelegramChannelMessage {
   @Column('simple-json', { nullable: true })
   foundPhoneNumbers: string[] | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: 'timestamptz' })
   receivedAt: Date;
 }

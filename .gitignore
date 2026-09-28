@@ -62,3 +62,6 @@ node_modules/
 dist/
 cdn
 uploads
+
+# JWT RS256 public key
+/keys

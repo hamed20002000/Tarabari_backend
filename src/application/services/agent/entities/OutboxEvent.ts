@@ -24,6 +24,6 @@ export class OutboxEvent {
   @Column({ default: false })
   published: boolean;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 }

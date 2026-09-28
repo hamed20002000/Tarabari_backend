@@ -15,13 +15,15 @@ import { WhatsappAuthCredential } from '../entities/WhatsappAuthCredential';
 import { WhatsappAuthKey } from '../entities/WhatsappAuthKey';
 import { WhatsappChannelMessage } from '../entities/WhatsappChannelMessage';
 import { MonitoredChannel } from '../entities/MonitoredChannel';
-import { MonitoredChatType, MonitoredChannelRole } from '../types';
+import { ChannelMembershipStatus, MonitoredChatType, MonitoredChannelRole } from '../types';
+import { ChannelMembershipService } from './channelMembership.service';
 import { useDbAuthState } from '../hooks/useDbAuthState';
 import { SpeechToTextService } from './speechToText.service';
 import { CargoPipelineService } from './cargoPipeline.service';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
 import { RecentIdCache } from '../common/recentIdCache';
 import { exponentialBackoffMinutes } from '../common/backoff';
+import { isChannelMonitoringEnabled } from '../common/channelMonitoring';
 
 const DEFAULT_SESSION_ID = 'main';
 
@@ -29,6 +31,28 @@ const DEFAULT_SESSION_ID = 'main';
 // (سفارش‌های بار تشخیص‌داده‌شده) مستقیماً بهش هم فرستاده می‌شن. از .env
 // خونده می‌شه -- اگه خالی باشه، این قابلیت به‌سادگی غیرفعال می‌مونه.
 const PERSONAL_NOTIFY_NUMBER = process.env.WHATSAPP_PERSONAL_NOTIFY_NUMBER || '';
+
+// درخواست عضویت ثبت شده و منتظر تایید ادمین گروهه.
+class WhatsappJoinPendingError extends Error { }
+// خطایی که با تلاش دوباره درست نمی‌شه (لینک نامعتبر/باطل، بن شدن).
+class WhatsappPermanentJoinError extends Error { }
+
+// کدهای HTTP که Baileys (Boom) برای خطاهای دائمی عضویت برمی‌گردونه.
+const PERMANENT_JOIN_STATUS: Record<number, string> = {
+  400: 'لینک دعوت نامعتبره.',
+  401: 'ربات اجازه‌ی عضویت در این گروه/کانال رو نداره (احتمالاً حذف یا بن شده).',
+  403: 'ربات اجازه‌ی عضویت در این گروه/کانال رو نداره.',
+  404: 'گروه/کانالی با این لینک پیدا نشد.',
+  406: 'لینک دعوت نامعتبره.',
+  410: 'لینک دعوت باطل یا منقضی شده.',
+};
+
+function toJoinError(error: unknown): Error {
+  if (error instanceof WhatsappPermanentJoinError || error instanceof WhatsappJoinPendingError) return error;
+  const status = (error as Boom)?.output?.statusCode;
+  if (status && PERMANENT_JOIN_STATUS[status]) return new WhatsappPermanentJoinError(PERMANENT_JOIN_STATUS[status]);
+  return new Error(`عضویت ناموفق بود: ${(error as Error)?.message ?? String(error)}`);
+}
 
 @Injectable()
 export class WhatsappService implements OnModuleInit {
@@ -51,6 +75,9 @@ export class WhatsappService implements OnModuleInit {
   // پارامترهای exponential backoff برای تلاش مجدد بعد از شکست.
   private static readonly BACKOFF_BASE_MINUTES = 5;
   private static readonly BACKOFF_MAX_MINUTES = 60;
+  // بعد از این تعداد خطای موقت پشت‌سرهم، عضویت ناموفق اعلام و متوقف می‌شه.
+  private static readonly MAX_JOIN_ATTEMPTS = 5;
+  private isSyncingChannels = false;
 
   // بعد از اتصال، اگه PERSONAL_NOTIFY_NUMBER تنظیم شده باشه، JID
   // تاییدشده‌اش اینجا کش می‌شه.
@@ -66,6 +93,7 @@ export class WhatsappService implements OnModuleInit {
     @InjectRepository(MonitoredChannel)
     private readonly monitoredChannelRepo: Repository<MonitoredChannel>,
     private readonly cargoPipeline: CargoPipelineService,
+    private readonly membership: ChannelMembershipService,
     private readonly speechToTextService: SpeechToTextService,
   ) { }
 
@@ -147,14 +175,13 @@ export class WhatsappService implements OnModuleInit {
 
       this.logger.warn(`🚫 ربات از گروه حذف شد: ${groupJid}`);
 
-      await this.monitoredChannelRepo.update(
-        { resolvedJid: groupJid },
-        {
-          isActive: false,
-          isFollowed: false,
-          lastError: 'ربات از گروه حذف شد (kicked/removed).',
-        },
-      );
+      const removedFrom = await this.monitoredChannelRepo.find({ where: { resolvedJid: groupJid } });
+      for (const channel of removedFrom) {
+        channel.isActive = false;
+        channel.isFollowed = false;
+        channel.lastError = 'ربات از گروه حذف شد (kicked/removed).';
+        await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.REMOVED, channel.lastError);
+      }
     });
 
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -179,59 +206,90 @@ export class WhatsappService implements OnModuleInit {
 
   @Cron('*/2 * * * *')
   async syncMonitoredChannels(): Promise<void> {
-    if (!this.sock) return;
+    if (!this.sock || !isChannelMonitoringEnabled('whatsapp') || this.isSyncingChannels) return;
 
-    const pendingChannels = await this.monitoredChannelRepo.find({
-      where: [
-        { isActive: true, isFollowed: false, nextAttemptAt: IsNull() },
-        { isActive: true, isFollowed: false, nextAttemptAt: LessThanOrEqual(new Date()) },
-      ],
-    });
+    // جلوی اجرای هم‌زمان cron رو می‌گیره -- وگرنه با صف طولانی (۱۵ ثانیه
+    // فاصله برای هر گروه) یک گروه ممکن بود دو بار درخواست عضویت بگیره.
+    this.isSyncingChannels = true;
+    try {
+      const pendingChannels = await this.monitoredChannelRepo.find({
+        where: [
+          { isActive: true, isFollowed: false, nextAttemptAt: IsNull() },
+          { isActive: true, isFollowed: false, nextAttemptAt: LessThanOrEqual(new Date()) },
+        ],
+      });
 
-    if (pendingChannels.length === 0) return;
+      if (pendingChannels.length === 0) return;
 
-    this.logger.log(`${pendingChannels.length} گروه/کانال جدید پیدا شد، در حال پردازش...`);
+      this.logger.log(`${pendingChannels.length} گروه/کانال جدید پیدا شد، در حال پردازش...`);
 
-    for (const channel of pendingChannels) {
-      try {
-        const resolvedJid =
-          channel.type === MonitoredChatType.GROUP
-            ? await this.joinGroup(channel.identifier)
-            : await this.followChannel(channel.identifier);
-
-        channel.resolvedJid = resolvedJid;
-        channel.isFollowed = true;
-        channel.lastError = null;
-        channel.retryCount = 0;
-        channel.nextAttemptAt = null;
-        await this.monitoredChannelRepo.save(channel);
-
-        this.logger.log(
-          `${channel.type === MonitoredChatType.GROUP ? 'به گروه پیوست' : 'کانال دنبال شد'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
-        );
-
-        await new Promise((resolve) =>
-          setTimeout(resolve, WhatsappService.FOLLOW_DELAY_MS),
-        );
-      } catch (error) {
-        channel.lastError = (error as Error).message;
-        channel.retryCount += 1;
-
-        const backoffMinutes = exponentialBackoffMinutes(
-          channel.retryCount,
-          WhatsappService.BACKOFF_BASE_MINUTES,
-          WhatsappService.BACKOFF_MAX_MINUTES,
-        );
-        channel.nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
-
-        await this.monitoredChannelRepo.save(channel);
-
-        this.logger.error(
-          `پردازش نشد (${channel.type}): ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه دوباره تلاش می‌شه (تلاش #${channel.retryCount})`,
-          error as Error,
-        );
+      for (const channel of pendingChannels) {
+        await this.joinMonitoredChannel(channel);
       }
+    } finally {
+      this.isSyncingChannels = false;
     }
+  }
+
+  private async joinMonitoredChannel(channel: MonitoredChannel): Promise<void> {
+    try {
+      const resolvedJid =
+        channel.type === MonitoredChatType.GROUP
+          ? await this.joinGroup(channel.identifier)
+          : await this.followChannel(channel.identifier);
+
+      channel.resolvedJid = resolvedJid;
+      channel.isFollowed = true;
+      channel.lastError = null;
+      channel.retryCount = 0;
+      channel.nextAttemptAt = null;
+      await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.JOINED);
+
+      this.logger.log(
+        `${channel.type === MonitoredChatType.GROUP ? 'به گروه پیوست' : 'کانال دنبال شد'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, WhatsappService.FOLLOW_DELAY_MS));
+      return;
+    } catch (error) {
+      await this.handleJoinError(channel, error);
+    }
+  }
+
+  private async handleJoinError(channel: MonitoredChannel, error: unknown): Promise<void> {
+    channel.lastError = (error as Error)?.message ?? String(error);
+
+    const permanent = error instanceof WhatsappPermanentJoinError;
+    const pending = error instanceof WhatsappJoinPendingError;
+    channel.retryCount += 1;
+
+    // خطای دائمی، یا خطای موقتی که چند بار پشت‌سرهم تکرار شده -- دیگه تلاش نمی‌شه.
+    if (permanent || (!pending && channel.retryCount >= WhatsappService.MAX_JOIN_ATTEMPTS)) {
+      channel.isActive = false;
+      channel.nextAttemptAt = null;
+      await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.FAILED, channel.lastError);
+      this.logger.error(`عضویت ممکن نیست (${channel.type}): ${channel.identifier} -- ${channel.lastError}`);
+      return;
+    }
+
+    // منتظر تایید ادمین: با همون backoff دوباره بررسی می‌شه تا تایید بشه.
+    const backoffMinutes = exponentialBackoffMinutes(
+      channel.retryCount,
+      WhatsappService.BACKOFF_BASE_MINUTES,
+      WhatsappService.BACKOFF_MAX_MINUTES,
+    );
+    channel.nextAttemptAt = new Date(Date.now() + backoffMinutes * 60 * 1000);
+
+    if (pending) {
+      await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.PENDING, channel.lastError);
+    } else {
+      await this.monitoredChannelRepo.save(channel);
+    }
+
+    this.logger.error(
+      `پردازش نشد (${channel.type}): ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه دوباره تلاش می‌شه (تلاش #${channel.retryCount})`,
+      error as Error,
+    );
   }
 
   private isLikelyMobileNumber(rawNumber: string): boolean {
@@ -279,12 +337,17 @@ export class WhatsappService implements OnModuleInit {
   private async followChannel(identifier: string): Promise<string> {
     if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
 
-    const metadata = identifier.endsWith('@newsletter')
-      ? { id: identifier }
-      : await this.sock.newsletterMetadata('invite', identifier);
+    try {
+      const metadata = identifier.endsWith('@newsletter')
+        ? { id: identifier }
+        : await this.sock.newsletterMetadata('invite', identifier);
+      if (!metadata?.id) throw new WhatsappPermanentJoinError('کانالی با این لینک پیدا نشد.');
 
-    await this.sock.newsletterFollow(metadata.id);
-    return metadata.id;
+      await this.sock.newsletterFollow(metadata.id);
+      return metadata.id;
+    } catch (error) {
+      throw toJoinError(error);
+    }
   }
 
   private async joinGroup(identifier: string): Promise<string> {
@@ -297,26 +360,24 @@ export class WhatsappService implements OnModuleInit {
     try {
       const result = await this.sock.groupAcceptInvite(identifier);
 
+      // گروهی که تایید ادمین لازم داره jid برنمی‌گردونه -- درخواست ثبت شده.
       if (!result || typeof result !== 'string') {
-        throw new Error(
-          'درخواست عضویت در گروه ارسال شد ولی ممکنه منتظر تایید باشه (احتمالاً Admin Approval فعاله).',
-        );
+        throw new WhatsappJoinPendingError('درخواست عضویت فرستاده شد و منتظر تایید ادمین گروهه.');
       }
 
       return result;
     } catch (error) {
+      if (error instanceof WhatsappJoinPendingError) throw error;
       this.logger.error(
         `جزئیات خام خطای groupAcceptInvite: ${JSON.stringify(error, Object.getOwnPropertyNames(error as object))}`,
       );
-
-      throw new Error(
-        `عضویت در گروه ناموفق بود (احتمالاً Admin Approval فعاله): ${(error as Error).message}`,
-      );
+      throw toJoinError(error);
     }
   }
 
   // پیام‌ها یکی‌یکی پردازش می‌شن -- جلوگیری از درخواست‌های هم‌زمان به Ollama.
   private enqueueChannelMessage(msg: WAMessage): void {
+    if (!isChannelMonitoringEnabled('whatsapp')) return;
     void this.messageQueue.run(() => this.handleChannelMessage(msg)).catch((error) =>
       this.logger.error(`خطا در پردازش پیام کانال/گروه: ${msg.key.remoteJid}`, error as Error),
     );
@@ -360,6 +421,12 @@ export class WhatsappService implements OnModuleInit {
       if (!text) return;
     }
 
+    // کاربری که این گروه/کانال رو ثبت کرده -- اعلان بار برای همون کاربر فرستاده می‌شه.
+    const channel = await this.monitoredChannelRepo.findOne({
+      where: { resolvedJid: channelJid },
+      select: { id: true, ownerUserIds: true },
+    });
+
     const extraction = await this.cargoPipeline.process({
       label: `${channelJid} ${messageId}`,
       text,
@@ -367,6 +434,7 @@ export class WhatsappService implements OnModuleInit {
       entity: WhatsappChannelMessage,
       record: { channelJid, messageId, isCargoOrder: true },
       source: { platform: 'whatsapp', channelJid },
+      ownerUserIds: channel?.ownerUserIds ?? [],
     });
     if (!extraction) return;
 

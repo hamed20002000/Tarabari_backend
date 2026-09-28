@@ -4,7 +4,7 @@ import {
   Column,
   CreateDateColumn,
 } from 'typeorm';
-import { MonitoredChannelRole, MonitoredChatType } from '../types';
+import { ChannelMembershipStatus, MonitoredChannelRole, MonitoredChatType } from '../types';
 
 
 
@@ -35,6 +35,12 @@ export class MonitoredChannel {
   @Column({ nullable: true })
   resolvedJid: string | null;
 
+  // کاربرهایی که این گروه/کانال رو ثبت کردن. پیام‌ها همیشه پردازش می‌شن،
+  // ولی اعلان و نمایش پیام‌های بارِ این گروه/کانال فقط برای همین کاربرهاست
+  // (ownerUserIds در payload رویداد). ایندکس GIN در مایگریشن ساخته شده.
+  @Column('text', { array: true, default: () => "'{}'" })
+  ownerUserIds: string[];
+
   // اسم دلخواه برای نمایش در پنل مدیر (مثلاً "گروه بار تهران-مشهد").
   @Column({ nullable: true })
   label: string | null;
@@ -61,9 +67,14 @@ export class MonitoredChannel {
   // NEW: زمانی که اولین بار مجدداً باید این رکورد امتحان بشه. تا این زمان
   // نرسیده، polling این رکورد رو کلاً نادیده می‌گیره -- حتی اگه isFollowed
   // هنوز false باشه. با هر موفقیت null می‌شه.
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   nextAttemptAt: Date | null;
 
-  @CreateDateColumn()
+  // وضعیت عضویت از دید کاربر -- هر تغییرش از طریق ChannelMembershipService
+  // (رویداد channel.membership.changed) به ثبت‌کننده‌ها اعلام می‌شه.
+  @Column({ type: 'varchar', length: 20, default: ChannelMembershipStatus.QUEUED })
+  membershipStatus: ChannelMembershipStatus;
+
+  @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 }

@@ -13,6 +13,6 @@ export class WhatsappAuthCredential {
   @Column({ type: 'text' })
   credsJson: string;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: 'timestamptz' })
   updatedAt: Date;
 }

@@ -13,6 +13,6 @@ export class TelegramUserSession {
   @Column('text')
   session: string;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: 'timestamptz' })
   updatedAt: Date;
 }

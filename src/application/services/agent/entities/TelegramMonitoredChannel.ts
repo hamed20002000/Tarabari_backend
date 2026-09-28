@@ -5,7 +5,7 @@ import {
   CreateDateColumn,
   Index,
 } from 'typeorm';
-import { MonitoredChannelRole, MonitoredChatType } from '../types';
+import { ChannelMembershipStatus, MonitoredChannelRole, MonitoredChatType } from '../types';
 
 /**
  * گروه/کانال‌های تلگرامی که اکانت کاربری برنامه (GramJS) بهشون گوش می‌ده --
@@ -35,6 +35,12 @@ export class TelegramMonitoredChannel {
   @Column({ type: 'enum', enum: MonitoredChannelRole, default: MonitoredChannelRole.SOURCE })
   role: MonitoredChannelRole;
 
+  // کاربرهایی که این گروه/کانال رو ثبت کردن. پیام‌ها همیشه پردازش می‌شن،
+  // ولی اعلان و نمایش پیام‌های بارِ این گروه/کانال فقط برای همین کاربرهاست
+  // (ownerUserIds در payload رویداد). ایندکس GIN در مایگریشن ساخته شده.
+  @Column('text', { array: true, default: () => "'{}'" })
+  ownerUserIds: string[];
+
   // اسم نمایشی -- اگه خالی باشه، موقع عضویت از عنوان چت پر می‌شه.
   @Column({ type: 'varchar', nullable: true })
   label: string | null;
@@ -56,16 +62,21 @@ export class TelegramMonitoredChannel {
   @Column({ default: 0 })
   retryCount: number;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   nextAttemptAt: Date | null;
 
   // زمان آخرین تلاش عضویت -- برای اعمال سقف روزانه‌ی عضویت (ضد بن).
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   lastJoinAttemptAt: Date | null;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   joinedAt: Date | null;
 
-  @CreateDateColumn()
+  // وضعیت عضویت از دید کاربر -- هر تغییرش از طریق ChannelMembershipService
+  // (رویداد channel.membership.changed) به ثبت‌کننده‌ها اعلام می‌شه.
+  @Column({ type: 'varchar', length: 20, default: ChannelMembershipStatus.QUEUED })
+  membershipStatus: ChannelMembershipStatus;
+
+  @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 }

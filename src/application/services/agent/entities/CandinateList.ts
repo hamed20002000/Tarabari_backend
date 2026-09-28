@@ -66,9 +66,9 @@ export class CandidateListing {
   @Column({ nullable: true })
   selectedByCompanyPhone: string | null;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamptz', nullable: true })
   selectedAt: Date | null;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;
 }

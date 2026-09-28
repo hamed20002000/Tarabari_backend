@@ -167,3 +167,19 @@ export enum MonitoredChannelRole {
   DESTINATION = 'destination',
   BOTH = 'both',
 }
+/**
+ * وضعیت عضویت برنامه در گروه/کانال -- با هر تغییر، رویداد
+ * channel.membership.changed برای ثبت‌کننده‌ها منتشر می‌شه.
+ *   queued  -- ثبت شده، هنوز برای عضویت اقدام نشده
+ *   pending -- درخواست عضویت فرستاده شده و منتظر تایید ادمینه
+ *   joined  -- عضو شد و پیام‌هاش خونده می‌شه
+ *   failed  -- عضویت ممکن نشد (لینک نامعتبر/منقضی، رد درخواست، بن و ...)
+ *   removed -- ربات از گروه حذف شد
+ */
+export enum ChannelMembershipStatus {
+  QUEUED = 'queued',
+  PENDING = 'pending',
+  JOINED = 'joined',
+  FAILED = 'failed',
+  REMOVED = 'removed',
+}

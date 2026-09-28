@@ -36,6 +36,9 @@ export class OutboxService {
           'cargo_events', // اسم exchange
           event.eventType, // routing key
           event.payload,
+          // persistent: اگه خود RabbitMQ ریستارت بشه، پیام‌های داخل صف durable
+          // مصرف‌کننده‌ها (مثل transport_backend) از بین نمی‌رن.
+          { persistent: true, messageId: event.id, contentType: 'application/json' },
         );
 
         event.published = true;

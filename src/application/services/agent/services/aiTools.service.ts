@@ -63,10 +63,7 @@ class TransportOrderService {
     }
   }
 
-  DetermineTextIsTransportOrder(
-    prompt: string,
-    replacementNumber: string = '09394113259',
-  ): Promise<CargoOrderExtraction> {
+  DetermineTextIsTransportOrder(prompt: string): Promise<CargoOrderExtraction> {
     return this.modelQueue.run(() => this.runDetection(prompt));
   }
 

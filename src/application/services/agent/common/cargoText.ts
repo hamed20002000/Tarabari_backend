@@ -1,14 +1,12 @@
 import { CargoOrderExtraction } from '../services/aiTools.service';
 
-export const CHANNEL_REPLACEMENT_NUMBER = '09394113259'; // بهتره از config/env بیاد
-
 /**
  * متن نهایی یک سفارش بار (برای توزیع‌کننده) -- مشترک بین واتساپ و تلگرام
- * تا خروجی هر دو پلتفرم یکسان باشه.
+ * تا خروجی هر دو پلتفرم یکسان باشه. شماره‌ی تماس اینجا نوشته نمی‌شه:
+ * transport_backend شماره‌ی هر ثبت‌کننده (User.mobile) رو خودش اضافه می‌کنه.
  */
 export function buildCargoProcessedText(
   data: CargoOrderExtraction,
-  replacementNumber: string,
   orderCode?: string,
 ): string {
   if (!data.is_cargo_order) {
@@ -45,9 +43,6 @@ export function buildCargoProcessedText(
   if (data.extra_notes && !phoneRelatedPattern.test(data.extra_notes)) {
     lines.push(data.extra_notes);
   }
-
-  lines.push('');
-  lines.push(`شماره تماس: ${replacementNumber}`);
 
   if (orderCode) {
     lines.push(`کد پیگیری: ${orderCode}`);

@@ -20,6 +20,6 @@ export class WhatsappAuthKey {
   @Column({ type: 'text' })
   valueJson: string;
 
-  @UpdateDateColumn()
+  @UpdateDateColumn({ type: 'timestamptz' })
   updatedAt: Date;
 }

@@ -1,9 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { UserModule } from './application/services/user/appModuls/user.module';
-import { AuthModule } from './auth/auth.module';
-import { Users } from 'src/domain/entities/Users';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { MulterModule } from '@nestjs/platform-express';
 import { fileUploadOptions } from './interceptors/file-option';
@@ -29,6 +26,8 @@ import { CargoSubscription } from './application/services/agent/entities/CargoSu
 import { BaseinfoModule } from './application/services/agent/appModule/base.module';
 import { OutboxModule } from './application/services/agent/appModule/outbox.module';
 import { ScheduleModule } from '@nestjs/schedule';
+import { APP_GUARD } from '@nestjs/core';
+import { InternalApiKeyGuard } from './infrastructure/security/internalApiKey.guard';
 
 @Module({
   imports: [
@@ -67,7 +66,6 @@ import { ScheduleModule } from '@nestjs/schedule';
         password: configService.get<string>('DB_PASSWORD', '123qwe$%'),
         database: configService.get<string>('DB_DATABASE', 'SetasportalDb'),
         entities: [
-          Users,
           TelegramLink,
           TelegramLinkCode,
           WhatsappAuthCredential,
@@ -98,14 +96,17 @@ import { ScheduleModule } from '@nestjs/schedule';
         extra: {
           keepAlive: true,
           keepAliveInitialDelayMillis: 30000,
+          // همه‌ی ستون‌های زمانی timestamptz هستن؛ نشست دیتابیس روی UTC تا به
+          // TimeZone سرور Postgres یا TZ پروسه‌ی Node وابسته نباشه.
+          options: '-c timezone=UTC',
         },
       }),
     }),
-    AuthModule,
-    UserModule,
     WhatsappModule,
     BaseinfoModule, // NEW
     OutboxModule,
   ],
+  // همه‌ی APIها فقط برای transport_backend هستن -- هدر x-internal-api-key الزامیه.
+  providers: [{ provide: APP_GUARD, useClass: InternalApiKeyGuard }],
 })
 export class AppModule {}

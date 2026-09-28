@@ -17,12 +17,14 @@ import { LogLevel } from 'telegram/extensions/Logger';
 import { TelegramMonitoredChannel } from '../entities/TelegramMonitoredChannel';
 import { TelegramChannelMessage } from '../entities/TelegramChannelMessage';
 import { TelegramUserSession } from '../entities/TelegramUserSession';
-import { MonitoredChatType, MonitoredChannelRole } from '../types';
+import { ChannelMembershipStatus, MonitoredChatType, MonitoredChannelRole } from '../types';
+import { ChannelMembershipService } from './channelMembership.service';
 import { SpeechToTextService } from './speechToText.service';
 import { CargoPipelineService } from './cargoPipeline.service';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
 import { RecentIdCache } from '../common/recentIdCache';
 import { exponentialBackoffMinutes } from '../common/backoff';
+import { isChannelMonitoringEnabled } from '../common/channelMonitoring';
 import {
   TELEGRAM_SESSION_ID,
   buildTelegramClientParams,
@@ -44,7 +46,7 @@ interface JoinResult {
   pending: boolean;
 }
 
-type ParsedIdentifier = { kind: 'invite'; hash: string } | { kind: 'username'; username: string };
+export type ParsedIdentifier = { kind: 'invite'; hash: string } | { kind: 'username'; username: string };
 
 // خطاهایی که با تلاش دوباره درست نمی‌شن -- رکورد غیرفعال می‌شه تا مدیر لینک رو اصلاح کنه.
 class PermanentJoinError extends Error { }
@@ -91,6 +93,9 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
   private static readonly DAILY_JOIN_LIMIT = Number(process.env.TELEGRAM_DAILY_JOIN_LIMIT) || 20;
   private static readonly PENDING_RECHECK_MINUTES = 30;
   private static readonly PENDING_RECHECK_MAX_MINUTES = 24 * 60;
+  // تلگرام رد شدن درخواست عضویت رو اعلام نمی‌کنه (از بیرون با «هنوز منتظر»
+  // فرقی نداره) -- درخواستی که تا این مدت تایید نشه، رد‌شده حساب می‌شه.
+  private static readonly JOIN_REQUEST_MAX_DAYS = Number(process.env.TELEGRAM_JOIN_REQUEST_MAX_DAYS) || 7;
   private static readonly BACKOFF_BASE_MINUTES = 15;
   private static readonly BACKOFF_MAX_MINUTES = 6 * 60;
 
@@ -107,6 +112,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(TelegramUserSession)
     private readonly sessionRepo: Repository<TelegramUserSession>,
     private readonly cargoPipeline: CargoPipelineService,
+    private readonly membership: ChannelMembershipService,
     private readonly speechToTextService: SpeechToTextService,
   ) { }
 
@@ -120,6 +126,12 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async start(): Promise<void> {
+    // بدون اتصال، نه عضویتی انجام می‌شه و نه پیامی دریافت می‌شه (cronها با client=null کاری نمی‌کنن).
+    if (!isChannelMonitoringEnabled('telegram')) {
+      this.logger.warn('تلگرام در CHANNEL_MONITORING_ENABLED نیست -- عضویت و گوش دادن به گروه/کانال‌های تلگرام غیرفعاله.');
+      return;
+    }
+
     const credentials = getTelegramApiCredentials();
     if (!credentials) {
       this.logger.warn('TELEGRAM_API_ID/TELEGRAM_API_HASH تعریف نشده -- مانیتورینگ تلگرام غیرفعاله.');
@@ -230,7 +242,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
       channel.joinedAt = channel.joinedAt ?? new Date();
       channel.lastError = null;
       channel.nextAttemptAt = null;
-      await this.monitoredChannelRepo.save(channel);
+      await this.membership.transition('telegram', channel, ChannelMembershipStatus.JOINED);
     }
 
     const existing = await this.channelMessageRepo.findOne({ where: { chatId, messageId } });
@@ -263,6 +275,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
       entity: TelegramChannelMessage,
       record: { chatId, messageId },
       source: { platform: 'telegram', chatId },
+      ownerUserIds: channel.ownerUserIds,
     });
   }
 
@@ -344,6 +357,15 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
     });
 
     for (const channel of pending) {
+      const requestedAt = channel.lastJoinAttemptAt?.getTime() ?? Date.now();
+      if (Date.now() - requestedAt > TelegramChannelService.JOIN_REQUEST_MAX_DAYS * 24 * 60 * 60_000) {
+        await this.markFailed(
+          channel,
+          `درخواست عضویت ظرف ${TelegramChannelService.JOIN_REQUEST_MAX_DAYS} روز توسط ادمین گروه/کانال تایید نشد.`,
+        );
+        continue;
+      }
+
       try {
         const result = await this.checkMembership(channel.identifier!);
         if (result) {
@@ -374,6 +396,17 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
     if (result.chatId && result.chatId !== channel.chatId) {
       const duplicate = await this.monitoredChannelRepo.findOne({ where: { chatId: result.chatId } });
       if (duplicate && duplicate.id !== channel.id) {
+        // همون گروه/کانال با لینک دیگه‌ای ثبت شده -- ثبت‌کننده‌های این رکورد
+        // به رکورد اصلی منتقل می‌شن تا اعلان‌ها براشون قطع نشه.
+        const missingOwners = channel.ownerUserIds.filter((id) => !duplicate.ownerUserIds.includes(id));
+        if (missingOwners.length > 0) {
+          duplicate.ownerUserIds = [...duplicate.ownerUserIds, ...missingOwners];
+          await this.monitoredChannelRepo.save(duplicate);
+          // وضعیت رکورد اصلی (مثلاً «عضو شد») به کاربرهای منتقل‌شده اعلام می‌شه.
+          await this.membership.announce('telegram', duplicate, missingOwners);
+        }
+        // ثبت‌کننده‌ها منتقل شدن -- این رکورد دیگه در لیست هیچ کاربری نمیاد.
+        channel.ownerUserIds = [];
         channel.isActive = false;
         channel.joinRequestPending = false;
         channel.nextAttemptAt = null;
@@ -396,15 +429,25 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
         Date.now() + TelegramChannelService.PENDING_RECHECK_MINUTES * 60_000,
       );
       this.logger.log(`📨 درخواست عضویت فرستاده شد، منتظر تایید ادمین: ${channel.identifier}`);
+      await this.membership.transition('telegram', channel, ChannelMembershipStatus.PENDING);
     } else {
       channel.isMember = true;
       channel.joinRequestPending = false;
       channel.joinedAt = channel.joinedAt ?? new Date();
       channel.nextAttemptAt = null;
       this.logger.log(`✅ عضو گروه/کانال تلگرام شد: ${channel.chatId} (${channel.label ?? channel.identifier})`);
+      await this.membership.transition('telegram', channel, ChannelMembershipStatus.JOINED);
     }
+  }
 
-    await this.monitoredChannelRepo.save(channel);
+  /** عضویت ممکن نیست -- رکورد غیرفعال می‌شه و به ثبت‌کننده‌ها اعلام می‌شه. */
+  private async markFailed(channel: TelegramMonitoredChannel, reason: string): Promise<void> {
+    channel.isActive = false;
+    channel.joinRequestPending = false;
+    channel.nextAttemptAt = null;
+    channel.lastError = reason;
+    await this.membership.transition('telegram', channel, ChannelMembershipStatus.FAILED, reason);
+    this.logger.error(`عضویت ممکن نیست (${channel.identifier}): ${reason}`);
   }
 
   private async handleJoinError(channel: TelegramMonitoredChannel, error: unknown): Promise<void> {
@@ -439,12 +482,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
             : null;
 
     if (permanentMessage) {
-      channel.isActive = false;
-      channel.joinRequestPending = false;
-      channel.nextAttemptAt = null;
-      channel.lastError = permanentMessage;
-      await this.monitoredChannelRepo.save(channel);
-      this.logger.error(`عضویت ممکن نیست (${channel.identifier}): ${permanentMessage}`);
+      await this.markFailed(channel, permanentMessage);
       return;
     }
 
@@ -470,7 +508,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
 
   private async joinByIdentifier(identifier: string): Promise<JoinResult> {
     const client = this.client!;
-    const parsed = this.parseIdentifier(identifier);
+    const parsed = TelegramChannelService.parseIdentifier(identifier);
 
     if (parsed.kind === 'invite') {
       const invite = await client.invoke(new Api.messages.CheckChatInvite({ hash: parsed.hash }));
@@ -528,7 +566,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
   /** اگه اکانت عضو شده باشه نتیجه‌ی عضویت رو برمی‌گردونه، وگرنه null. */
   private async checkMembership(identifier: string): Promise<JoinResult | null> {
     const client = this.client!;
-    const parsed = this.parseIdentifier(identifier);
+    const parsed = TelegramChannelService.parseIdentifier(identifier);
 
     if (parsed.kind === 'invite') {
       const invite = await client.invoke(new Api.messages.CheckChatInvite({ hash: parsed.hash }));
@@ -570,7 +608,7 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
    * لینک خصوصی: t.me/+HASH، t.me/joinchat/HASH یا +HASH
    * لینک عمومی: t.me/username، @username یا username
    */
-  private parseIdentifier(identifier: string): ParsedIdentifier {
+  static parseIdentifier(identifier: string): ParsedIdentifier {
     const value = identifier.trim();
 
     const invite = value.match(
@@ -588,6 +626,21 @@ export class TelegramChannelService implements OnModuleInit, OnModuleDestroy {
     if (username) return { kind: 'username', username: username[1] };
 
     throw new PermanentJoinError('فرمت لینک نامعتبره.');
+  }
+
+  /**
+   * شکل یکتای لینک برای ذخیره در identifier -- تا لینک‌های مختلفِ یک
+   * گروه/کانال (t.me/x، @x، https://t.me/x) یک رکورد بشن. لینک نامعتبر = null.
+   */
+  static normalizeIdentifier(identifier: string): string | null {
+    try {
+      const parsed = TelegramChannelService.parseIdentifier(identifier);
+      return parsed.kind === 'invite'
+        ? `https://t.me/+${parsed.hash}`
+        : `@${parsed.username.toLowerCase()}`;
+    } catch {
+      return null;
+    }
   }
 
   private randomJoinDelayMs(): number {
