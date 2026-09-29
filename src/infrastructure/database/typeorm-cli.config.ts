@@ -12,7 +12,7 @@ export const typeOrmConfig = (configService: ConfigService): TypeOrmModuleOption
   database: configService.get<string>('DB_DATABASE', 'SETASTAKIP'),
  /*  entities: ['src/domain/entities/*.ts'], */
   entities: ['src/application/services/agent/entities/TelegramMonitoredChannel.ts', 'src/application/services/agent/entities/TelegramChannelMessage.ts', 'src/application/services/agent/entities/TelegramUserSession.ts', 'src/application/services/agent/entities/MonitoredChannel.ts'],
-  migrations: ['src/infrastructure/database/migrations/*-CreateTelegramChannelTables.ts', 'src/infrastructure/database/migrations/*-TelegramUserAccount.ts', 'src/infrastructure/database/migrations/*-ChannelOwner.ts', 'src/infrastructure/database/migrations/*-ChannelOwners.ts', 'src/infrastructure/database/migrations/*-UserPhone.ts', 'src/infrastructure/database/migrations/*-DropUsers.ts', 'src/infrastructure/database/migrations/*-TimestampWithTimeZone.ts', 'src/infrastructure/database/migrations/*-ChannelMembershipStatus.ts'],  
+  migrations: ['src/infrastructure/database/migrations/*-CreateTelegramChannelTables.ts', 'src/infrastructure/database/migrations/*-TelegramUserAccount.ts', 'src/infrastructure/database/migrations/*-ChannelOwner.ts', 'src/infrastructure/database/migrations/*-ChannelOwners.ts', 'src/infrastructure/database/migrations/*-UserPhone.ts', 'src/infrastructure/database/migrations/*-DropUsers.ts', 'src/infrastructure/database/migrations/*-TimestampWithTimeZone.ts', 'src/infrastructure/database/migrations/*-ChannelMembershipStatus.ts', 'src/infrastructure/database/migrations/*-CargoCode.ts'],  
   migrationsRun: false,   
   synchronize: false, // Disable auto schema synchronization
   logging:true// ['error'], // Log only errors

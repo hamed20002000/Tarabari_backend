@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, DeepPartial, EntityTarget, ObjectLiteral } from 'typeorm';
+import { DataSource, DeepPartial, EntityManager, EntityTarget, ObjectLiteral } from 'typeorm';
 import { OutboxEvent } from '../entities/OutboxEvent';
 import { TransportOrderService, CargoOrderExtraction } from './aiTools.service';
 import { buildCargoProcessedText } from '../common/cargoText';
@@ -26,6 +26,7 @@ export interface CargoCandidate<T extends CargoMessageRecord> {
 
 export interface CargoMessageRecord extends ObjectLiteral {
   id: string;
+  code: string;
   receivedAt: Date;
 }
 
@@ -78,16 +79,18 @@ export class CargoPipelineService {
     { label, text, isVoice, entity, record, source, ownerUserIds }: CargoCandidate<T>,
     extraction: CargoOrderExtraction,
   ): Promise<void> {
-    const processedText = buildCargoProcessedText(extraction);
-
     // ذخیره‌ی رکورد پیام + ثبت رکورد outbox در یه تراکنش واحد -- یا هر دو
     // انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
     // توزیع‌کننده (برنامه‌ی دیگه) هست که این event رو مصرف می‌کنه.
     const saved = await this.dataSource.transaction(async (manager) => {
+      const code = await this.nextCargoCode(manager);
+      const processedText = buildCargoProcessedText(extraction, code);
+
       const message = await manager.save(
         entity,
         manager.create(entity, {
           ...record,
+          code,
           rawText: text,
           confidence: extraction.confidence,
           foundPhoneNumbers: extraction.found_phone_numbers,
@@ -99,6 +102,7 @@ export class CargoPipelineService {
         payload: {
           ...source,
           messageId: message.id,
+          code,
           isVoice,
           rawText: text,
           receivedAt: message.receivedAt,
@@ -117,6 +121,12 @@ export class CargoPipelineService {
       return message;
     });
 
-    this.logger.log(`✅ سفارش بار تشخیص داده شد [${label}] [${saved.id}]`);
+    this.logger.log(`✅ سفارش بار تشخیص داده شد [${label}] [${saved.code}]`);
+  }
+
+  /** کد پیگیری بعدی: TRB + عدد sequence مشترک بین واتساپ و تلگرام. */
+  private async nextCargoCode(manager: EntityManager): Promise<string> {
+    const [{ value }] = await manager.query(`SELECT nextval('cargo_code_seq') AS value`);
+    return `TRB${value}`;
   }
 }

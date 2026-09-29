@@ -17,6 +17,11 @@ export class TelegramChannelMessage {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  /** کد پیگیری بار (مثل TRB100000) -- از sequence مشترک cargo_code_seq، بین واتساپ و تلگرام یکتاست. */
+  @Index({ unique: true })
+  @Column({ type: 'varchar', length: 20 })
+  code: string;
+
   @Index('IDX_telegram_channel_message_chatId')
   @Column({ type: 'bigint' })
   chatId: string;

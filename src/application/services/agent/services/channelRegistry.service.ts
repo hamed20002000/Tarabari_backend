@@ -246,7 +246,7 @@ export class ChannelRegistryService {
       );
     }
     if (filter.search?.trim()) {
-      qb.andWhere('msg.rawText ILIKE :search', { search: `%${filter.search.trim()}%` });
+      qb.andWhere('(msg.rawText ILIKE :search OR msg.code ILIKE :search)', { search: `%${filter.search.trim()}%` });
     }
     if (filter.sourceId?.trim()) {
       qb.andWhere(`${sourceColumn} = :sourceId`, { sourceId: filter.sourceId.trim() });
@@ -260,6 +260,7 @@ export class ChannelRegistryService {
 
     const items = rows.map((row: WhatsappChannelMessage | TelegramChannelMessage) => ({
       id: row.id,
+      code: row.code,
       platform: filter.platform,
       sourceId: 'channelJid' in row ? row.channelJid : row.chatId,
       rawText: row.rawText,
