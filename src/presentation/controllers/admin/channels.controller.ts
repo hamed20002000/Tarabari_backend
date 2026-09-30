@@ -27,7 +27,7 @@ function parsePlatform(value: string | undefined, required = false): ChannelPlat
 }
 
 /**
- * API واحد گروه/کانال‌های واتساپ و تلگرام -- فقط transport_backend صداش
+ * API واحد گروه/کانال‌های واتساپ، تلگرام، بله و روبیکا -- فقط transport_backend صداش
  * می‌زنه (InternalApiKeyGuard). userId همون User.id در transport_backend هست.
  */
 @Controller('api/channels')

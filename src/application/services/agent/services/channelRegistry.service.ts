@@ -4,15 +4,22 @@ import { ArrayContains, FindOptionsWhere, In, Repository } from 'typeorm';
 import { isUUID } from 'class-validator';
 import { MonitoredChannel } from '../entities/MonitoredChannel';
 import { TelegramMonitoredChannel } from '../entities/TelegramMonitoredChannel';
+import { BaleMonitoredChannel } from '../entities/BaleMonitoredChannel';
+import { RubikaMonitoredChannel } from '../entities/RubikaMonitoredChannel';
 import { WhatsappChannelMessage } from '../entities/WhatsappChannelMessage';
 import { TelegramChannelMessage } from '../entities/TelegramChannelMessage';
+import { BaleChannelMessage } from '../entities/BaleChannelMessage';
+import { RubikaChannelMessage } from '../entities/RubikaChannelMessage';
+import { AccountChannelMessageBase, AccountMonitoredChannelBase } from '../entities/AccountChannelBase';
 import { ChannelMembershipStatus, MonitoredChannelRole, MonitoredChatType } from '../types';
+import { AccountPlatform, CHANNEL_PLATFORMS, ChannelPlatform } from '../common/channelMonitoring';
 import { TelegramChannelService } from './telegramChannel.service';
+import { BaleChannelService } from './baleChannel.service';
+import { RubikaChannelService } from './rubikaChannel.service';
 
-export type ChannelPlatform = 'whatsapp' | 'telegram';
-export const CHANNEL_PLATFORMS: ChannelPlatform[] = ['whatsapp', 'telegram'];
+export { CHANNEL_PLATFORMS, ChannelPlatform };
 
-/** شکل یکسان گروه/کانال برای هر دو پلتفرم. */
+/** شکل یکسان گروه/کانال برای همه‌ی پلتفرم‌ها. */
 export interface ChannelView {
   id: string;
   platform: ChannelPlatform;
@@ -40,13 +47,22 @@ export interface MessageFilter {
   platform: ChannelPlatform;
   userId?: string;
   search?: string;
-  /** شناسه‌ی گروه/کانال: JID واتساپ یا chatId تلگرام. */
+  /** شناسه‌ی گروه/کانال: JID واتساپ یا chatId بقیه‌ی پلتفرم‌ها. */
   sourceId?: string;
   page: number;
   limit: number;
 }
 
-type ChannelEntity = MonitoredChannel | TelegramMonitoredChannel;
+type ChannelEntity = MonitoredChannel | AccountMonitoredChannelBase;
+type MessageEntity = WhatsappChannelMessage | AccountChannelMessageBase;
+
+// شکل یکتای لینک هر پلتفرم اکانت‌محور؛ لینکی که مال اون پلتفرم نیست null می‌شه.
+// تلگرام آخره چون @username بدون دامنه هم مال تلگرام حساب می‌شه.
+const ACCOUNT_LINK_NORMALIZERS: [AccountPlatform, (link: string) => string | null][] = [
+  ['bale', BaleChannelService.normalizeIdentifier],
+  ['rubika', RubikaChannelService.normalizeIdentifier],
+  ['telegram', TelegramChannelService.normalizeIdentifier],
+];
 
 /**
  * نتیجه‌ی ثبت برای همین کاربر:
@@ -57,9 +73,11 @@ type ChannelEntity = MonitoredChannel | TelegramMonitoredChannel;
 export type RegisterStatus = 'created' | 'owner_added' | 'already_registered';
 
 /**
- * لینک دعوت واتساپ یا تلگرام رو تشخیص می‌ده و شکل یکتای ذخیره‌اش رو برمی‌گردونه.
+ * لینک دعوت گروه/کانال رو تشخیص می‌ده و شکل یکتای ذخیره‌اش رو برمی‌گردونه.
  *   واتساپ گروه:  chat.whatsapp.com/XXXX       کانال: whatsapp.com/channel/XXXX
  *   تلگرام:       t.me/username، @username، t.me/+HASH، t.me/joinchat/HASH
+ *   بله:          ble.ir/username، ble.ir/join/TOKEN
+ *   روبیکا:       rubika.ir/username، rubika.ir/joing/HASH، rubika.ir/joinc/HASH
  */
 function parseChannelLink(
   link: string,
@@ -75,31 +93,49 @@ function parseChannelLink(
     return { platform: 'whatsapp', identifier: whatsappChannel[1], type: MonitoredChatType.CHANNEL };
   }
 
-  // نوع گروه/کانال تلگرام تا قبل از عضویت معلوم نیست -- بعد از عضویت پر می‌شه.
-  const telegram = TelegramChannelService.normalizeIdentifier(trimmed);
-  if (telegram) return { platform: 'telegram', identifier: telegram, type: null };
+  // نوع گروه/کانال این پلتفرم‌ها تا قبل از عضویت معلوم نیست -- بعد از عضویت پر می‌شه.
+  for (const [platform, normalize] of ACCOUNT_LINK_NORMALIZERS) {
+    const identifier = normalize(trimmed);
+    if (identifier) return { platform, identifier, type: null };
+  }
 
   return null;
 }
 
 /**
- * ثبت و مدیریت گروه/کانال‌های واتساپ و تلگرام با یک API واحد. هر گروه/کانال
- * فقط یک بار عضو می‌شه ولی می‌تونه چند ثبت‌کننده (کاربر transport_backend)
- * داشته باشه؛ پیام‌های بار فقط به همین ثبت‌کننده‌ها اعلان/نمایش داده می‌شن.
- * جدول‌ها جدا می‌مونن چون فیلدهای عضویت دو پلتفرم فرق می‌کنه.
+ * ثبت و مدیریت گروه/کانال‌های واتساپ، تلگرام، بله و روبیکا با یک API واحد.
+ * هر گروه/کانال فقط یک بار عضو می‌شه ولی می‌تونه چند ثبت‌کننده (کاربر
+ * transport_backend) داشته باشه؛ پیام‌های بار فقط به همین ثبت‌کننده‌ها
+ * اعلان/نمایش داده می‌شن. هر پلتفرم جدول خودش رو داره.
  */
 @Injectable()
 export class ChannelRegistryService {
+  private readonly channelRepos: Record<ChannelPlatform, Repository<ChannelEntity>>;
+  private readonly messageRepos: Record<ChannelPlatform, Repository<MessageEntity>>;
+
   constructor(
-    @InjectRepository(MonitoredChannel)
-    private readonly whatsappRepo: Repository<MonitoredChannel>,
-    @InjectRepository(TelegramMonitoredChannel)
-    private readonly telegramRepo: Repository<TelegramMonitoredChannel>,
-    @InjectRepository(WhatsappChannelMessage)
-    private readonly whatsappMessageRepo: Repository<WhatsappChannelMessage>,
-    @InjectRepository(TelegramChannelMessage)
-    private readonly telegramMessageRepo: Repository<TelegramChannelMessage>,
-  ) {}
+    @InjectRepository(MonitoredChannel) whatsappRepo: Repository<MonitoredChannel>,
+    @InjectRepository(TelegramMonitoredChannel) telegramRepo: Repository<TelegramMonitoredChannel>,
+    @InjectRepository(BaleMonitoredChannel) baleRepo: Repository<BaleMonitoredChannel>,
+    @InjectRepository(RubikaMonitoredChannel) rubikaRepo: Repository<RubikaMonitoredChannel>,
+    @InjectRepository(WhatsappChannelMessage) whatsappMessageRepo: Repository<WhatsappChannelMessage>,
+    @InjectRepository(TelegramChannelMessage) telegramMessageRepo: Repository<TelegramChannelMessage>,
+    @InjectRepository(BaleChannelMessage) baleMessageRepo: Repository<BaleChannelMessage>,
+    @InjectRepository(RubikaChannelMessage) rubikaMessageRepo: Repository<RubikaChannelMessage>,
+  ) {
+    this.channelRepos = {
+      whatsapp: whatsappRepo,
+      telegram: telegramRepo,
+      bale: baleRepo,
+      rubika: rubikaRepo,
+    } as Record<ChannelPlatform, Repository<ChannelEntity>>;
+    this.messageRepos = {
+      whatsapp: whatsappMessageRepo,
+      telegram: telegramMessageRepo,
+      bale: baleMessageRepo,
+      rubika: rubikaMessageRepo,
+    } as Record<ChannelPlatform, Repository<MessageEntity>>;
+  }
 
   async register(input: {
     link: string;
@@ -113,7 +149,7 @@ export class ChannelRegistryService {
     const parsed = parseChannelLink(input.link);
     if (!parsed) {
       throw new BadRequestException(
-        'لینک نامعتبره. لینک گروه/کانال واتساپ (chat.whatsapp.com/... یا whatsapp.com/channel/...) یا تلگرام (t.me/... یا @username) باشه.',
+        'لینک نامعتبره. لینک گروه/کانال واتساپ (chat.whatsapp.com/... یا whatsapp.com/channel/...)، تلگرام (t.me/... یا @username)، بله (ble.ir/...) یا روبیکا (rubika.ir/...) باشه.',
       );
     }
 
@@ -128,7 +164,7 @@ export class ChannelRegistryService {
         ? 'توجه: ارسال پیام در کانال واتساپ فقط اگر بات ادمین آن کانال باشد کار می‌کند.'
         : undefined;
 
-    const repo = this.repo(parsed.platform);
+    const repo = this.channelRepos[parsed.platform];
     // رکوردهای قدیمی تلگرام ممکنه با شکل خام لینک ذخیره شده باشن.
     const existing = await repo.findOne({
       where: { identifier: In([parsed.identifier, input.link.trim()]) },
@@ -163,12 +199,9 @@ export class ChannelRegistryService {
       ownerUserIds: [userId],
       isActive: true,
     };
-    const channel =
-      parsed.platform === 'whatsapp'
-        ? await this.whatsappRepo.save(
-            this.whatsappRepo.create({ ...common, type: parsed.type!, isFollowed: false }),
-          )
-        : await this.telegramRepo.save(this.telegramRepo.create(common));
+    const channel = await repo.save(
+      repo.create(parsed.platform === 'whatsapp' ? { ...common, type: parsed.type!, isFollowed: false } : common),
+    );
 
     return { status: 'created', created: true, channel: this.toView(parsed.platform, channel), warning };
   }
@@ -182,7 +215,7 @@ export class ChannelRegistryService {
     const platforms = filter.platform ? [filter.platform] : CHANNEL_PLATFORMS;
     const results = await Promise.all(
       platforms.map(async (platform) => {
-        const rows = await this.repo(platform).find({ where, order: { createdAt: 'DESC' } });
+        const rows = await this.channelRepos[platform].find({ where, order: { createdAt: 'DESC' } });
         return rows.map((row) => this.toView(platform, row));
       }),
     );
@@ -195,13 +228,13 @@ export class ChannelRegistryService {
     const owner = this.requireUserId(userId);
     const channel = await this.findOrFail(platform, id);
     channel.ownerUserIds = channel.ownerUserIds.filter((existing) => existing !== owner);
-    await this.repo(platform).save(channel);
+    await this.channelRepos[platform].save(channel);
   }
 
   /** حذف کامل رکورد (برای همه‌ی ثبت‌کننده‌ها). */
   async delete(platform: ChannelPlatform, id: string): Promise<void> {
     await this.findOrFail(platform, id);
-    await this.repo(platform).delete(id);
+    await this.channelRepos[platform].delete(id);
   }
 
   async setActive(platform: ChannelPlatform, id: string, isActive: boolean): Promise<void> {
@@ -211,7 +244,7 @@ export class ChannelRegistryService {
     const retry =
       isActive &&
       [ChannelMembershipStatus.FAILED, ChannelMembershipStatus.REMOVED].includes(channel.membershipStatus);
-    await this.repo(platform).update(id, {
+    await this.channelRepos[platform].update(id, {
       isActive,
       ...(retry
         ? { membershipStatus: ChannelMembershipStatus.QUEUED, lastError: null, retryCount: 0, nextAttemptAt: null }
@@ -222,7 +255,7 @@ export class ChannelRegistryService {
   async setRole(platform: ChannelPlatform, id: string, role: MonitoredChannelRole): Promise<void> {
     this.assertRole(role);
     await this.findOrFail(platform, id);
-    await this.repo(platform).update(id, { role });
+    await this.channelRepos[platform].update(id, { role });
   }
 
   /**
@@ -232,14 +265,13 @@ export class ChannelRegistryService {
   async listMessages(filter: MessageFilter) {
     const userId = filter.userId ? this.requireUserId(filter.userId) : undefined;
     const isWhatsapp = filter.platform === 'whatsapp';
-    const qb = isWhatsapp
-      ? this.whatsappMessageRepo.createQueryBuilder('msg').where('msg.isCargoOrder IS TRUE')
-      : this.telegramMessageRepo.createQueryBuilder('msg');
+    const qb = this.messageRepos[filter.platform].createQueryBuilder('msg');
+    if (isWhatsapp) qb.where('msg.isCargoOrder IS TRUE');
     const sourceColumn = isWhatsapp ? 'msg.channelJid' : 'msg.chatId';
 
     if (userId) {
       qb.innerJoin(
-        isWhatsapp ? MonitoredChannel : TelegramMonitoredChannel,
+        this.channelRepos[filter.platform].target as Function,
         'channel',
         `channel.${isWhatsapp ? 'resolvedJid' : 'chatId'} = ${sourceColumn} AND :userId = ANY(channel.ownerUserIds)`,
         { userId },
@@ -258,7 +290,7 @@ export class ChannelRegistryService {
       .take(filter.limit)
       .getManyAndCount();
 
-    const items = rows.map((row: WhatsappChannelMessage | TelegramChannelMessage) => ({
+    const items = rows.map((row) => ({
       id: row.id,
       code: row.code,
       platform: filter.platform,
@@ -274,12 +306,8 @@ export class ChannelRegistryService {
 
   // ------------------------------------------------------------------
 
-  private repo(platform: ChannelPlatform): Repository<ChannelEntity> {
-    return (platform === 'whatsapp' ? this.whatsappRepo : this.telegramRepo) as Repository<ChannelEntity>;
-  }
-
   private async findOrFail(platform: ChannelPlatform, id: string): Promise<ChannelEntity> {
-    const channel = isUUID(id) ? await this.repo(platform).findOne({ where: { id } }) : null;
+    const channel = isUUID(id) ? await this.channelRepos[platform].findOne({ where: { id } }) : null;
     if (!channel) throw new NotFoundException('گروه/کانال یافت نشد.');
     return channel;
   }
@@ -294,8 +322,8 @@ export class ChannelRegistryService {
       role: row.role,
       label: row.label,
       isActive: row.isActive,
-      isMember: isWhatsapp ? row.isFollowed : (row as TelegramMonitoredChannel).isMember,
-      joinRequestPending: isWhatsapp ? false : (row as TelegramMonitoredChannel).joinRequestPending,
+      isMember: isWhatsapp ? row.isFollowed : row.isMember,
+      joinRequestPending: isWhatsapp ? false : row.joinRequestPending,
       membershipStatus: row.membershipStatus,
       lastError: row.lastError,
       ownerUserIds: row.ownerUserIds,

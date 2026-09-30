@@ -1,7 +1,5 @@
 import { TelegramClientParams } from 'telegram/client/telegramBaseClient';
 
-export const TELEGRAM_SESSION_ID = 'main';
-
 export function getTelegramApiCredentials(): { apiId: number; apiHash: string } | null {
   const apiId = Number(process.env.TELEGRAM_API_ID);
   const apiHash = process.env.TELEGRAM_API_HASH;

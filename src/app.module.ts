@@ -18,7 +18,11 @@ import { WhatsappChannelMessage } from './application/services/agent/entities/Wh
 import { MonitoredChannel } from './application/services/agent/entities/MonitoredChannel';
 import { TelegramMonitoredChannel } from './application/services/agent/entities/TelegramMonitoredChannel';
 import { TelegramChannelMessage } from './application/services/agent/entities/TelegramChannelMessage';
-import { TelegramUserSession } from './application/services/agent/entities/TelegramUserSession';
+import { BaleMonitoredChannel } from './application/services/agent/entities/BaleMonitoredChannel';
+import { BaleChannelMessage } from './application/services/agent/entities/BaleChannelMessage';
+import { RubikaMonitoredChannel } from './application/services/agent/entities/RubikaMonitoredChannel';
+import { RubikaChannelMessage } from './application/services/agent/entities/RubikaChannelMessage';
+import { MessengerSession } from './application/services/agent/entities/MessengerSession';
 import { OutboxEvent } from './application/services/agent/entities/OutboxEvent';
 import { CandidateListing } from './application/services/agent/entities/CandinateList';
 import { CargoSubscription } from './application/services/agent/entities/CargoSubscription';
@@ -75,7 +79,11 @@ import { InternalApiKeyGuard } from './infrastructure/security/internalApiKey.gu
           MonitoredChannel, // NEW
           TelegramMonitoredChannel,
           TelegramChannelMessage,
-          TelegramUserSession,
+          BaleMonitoredChannel,
+          BaleChannelMessage,
+          RubikaMonitoredChannel,
+          RubikaChannelMessage,
+          MessengerSession,
           OutboxEvent,
           CandidateListing,
           CargoSubscription,

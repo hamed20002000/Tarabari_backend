@@ -1,6 +1,6 @@
 import { Body, Controller, Delete, Get, Param, ParseUUIDPipe, Post, Req } from '@nestjs/common';
 import { Transform } from 'class-transformer';
-import { IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { IsEnum, IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 import {
   CHANNEL_PLATFORMS,
   ChannelPlatform,
@@ -18,6 +18,10 @@ export class RegisterMyChannelDto {
 
   @IsOptional() @Transform(trim) @IsString() @MaxLength(100)
   label?: string;
+
+  // پیش‌فرض source: بار از این گروه/کانال خونده و به همین کاربر پیشنهاد می‌شه.
+  @IsOptional() @IsEnum(MonitoredChannelRole)
+  role?: MonitoredChannelRole;
 }
 
 class PlatformParams {
@@ -36,7 +40,7 @@ function toUserView({ ownerUserIds: _owners, ...channel }: ChannelView) {
 }
 
 /**
- * گروه/کانال‌های واتساپ و تلگرامِ خود کاربر -- مستقیم از فرانت با JWT کاربر.
+ * گروه/کانال‌های واتساپ، تلگرام، بله و روبیکای خود کاربر -- مستقیم از فرانت با JWT کاربر.
  * userId همیشه از توکن خونده می‌شه، نه از درخواست؛ پس هر کاربر فقط لیست
  * خودش رو می‌بینه و فقط خودش رو از ثبت‌کننده‌ها حذف می‌کنه.
  */
@@ -50,14 +54,13 @@ export class MyChannelsController {
     return (await this.registry.list({ userId: request.user.userId })).map(toUserView);
   }
 
-  // فقط منبع (source): بار از این گروه/کانال خونده و به همین کاربر پیشنهاد می‌شه.
   @Post()
   async register(@Req() request: UserRequest, @Body() dto: RegisterMyChannelDto) {
     const result = await this.registry.register({
       link: dto.link,
       label: dto.label,
       userId: request.user.userId,
-      role: MonitoredChannelRole.SOURCE,
+      role: dto.role ?? MonitoredChannelRole.SOURCE,
     });
     return { ...result, channel: toUserView(result.channel), warning: result.warning ?? null };
   }

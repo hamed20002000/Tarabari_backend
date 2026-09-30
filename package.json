@@ -21,11 +21,14 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "typeorm": "ts-node -r tsconfig-paths/register node_modules/typeorm/cli.js -d ./src/infrastructure/database/data-source.ts",
     "telegram:login": "ts-node -r tsconfig-paths/register scripts/telegram-login.ts",
+    "bale:login": "ts-node -r tsconfig-paths/register scripts/bale-login.ts",
+    "rubika:login": "ts-node -r tsconfig-paths/register scripts/rubika-login.ts",
     "seed": "ts-node -r tsconfig-paths/register src/infrastructure/database/seeds/seed.ts"
   },
   "dependencies": {
     "@golevelup/nestjs-rabbitmq": "^9.0.2",
     "@hapi/boom": "^10.0.1",
+    "@hoseinbnoob/balejs": "^0.1.0",
     "@nestjs/axios": "^4.0.0",
     "@nestjs/common": "^11.0.11",
     "@nestjs/config": "^4.0.4",
@@ -77,6 +80,7 @@
     "qrcode-terminal": "^0.12.0",
     "redis": "^4.7.0",
     "reflect-metadata": "^0.2.0",
+    "rubjs": "^3.2.4",
     "rxjs": "^7.8.1",
     "serve-static": "^1.16.2",
     "socket.io": "^4.8.1",

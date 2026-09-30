@@ -7,12 +7,16 @@ import { CargoSubscription } from '../entities/CargoSubscription';
 import { CargoSubscriptionController } from 'src/presentation/controllers/admin/cargoSubscription.controller';
 import { TelegramMonitoredChannel } from '../entities/TelegramMonitoredChannel';
 import { TelegramChannelMessage } from '../entities/TelegramChannelMessage';
+import { BaleMonitoredChannel } from '../entities/BaleMonitoredChannel';
+import { BaleChannelMessage } from '../entities/BaleChannelMessage';
+import { RubikaMonitoredChannel } from '../entities/RubikaMonitoredChannel';
+import { RubikaChannelMessage } from '../entities/RubikaChannelMessage';
 import { ChannelsController } from 'src/presentation/controllers/admin/channels.controller';
 import { ChannelRegistryService } from '../services/channelRegistry.service';
 import { MyChannelsController } from 'src/presentation/controllers/user/myChannels.controller';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([MonitoredChannel,WhatsappChannelMessage,CargoSubscription,TelegramMonitoredChannel,TelegramChannelMessage])],
+  imports: [TypeOrmModule.forFeature([MonitoredChannel,WhatsappChannelMessage,CargoSubscription,TelegramMonitoredChannel,TelegramChannelMessage,BaleMonitoredChannel,BaleChannelMessage,RubikaMonitoredChannel,RubikaChannelMessage])],
   controllers: [ChannelsController, CargoSubscriptionController, MyChannelsController],
   providers: [ChannelRegistryService],
 })

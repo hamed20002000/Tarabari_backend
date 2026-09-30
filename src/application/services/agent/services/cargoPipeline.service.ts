@@ -10,7 +10,7 @@ export interface CargoCandidate<T extends CargoMessageRecord> {
   label: string;
   text: string;
   isVoice: boolean;
-  /** entity پیام‌های بار همون پلتفرم (WhatsappChannelMessage یا TelegramChannelMessage). */
+  /** entity پیام‌های بار همون پلتفرم (WhatsappChannelMessage، TelegramChannelMessage و ...). */
   entity: EntityTarget<T>;
   /** فیلدهای مخصوص پلتفرم برای رکورد پیام (شناسه‌ی چت/پیام و ...). */
   record: DeepPartial<T>;
@@ -31,7 +31,7 @@ export interface CargoMessageRecord extends ObjectLiteral {
 }
 
 /**
- * خط لوله‌ی مشترک تشخیص بار برای واتساپ و تلگرام: فراخوانی مدل، و فقط برای
+ * خط لوله‌ی مشترک تشخیص بار برای همه‌ی پلتفرم‌ها: فراخوانی مدل، و فقط برای
  * سفارش بار -- ذخیره‌ی رکورد پیام + ثبت رویداد cargo.message.detected در یک
  * تراکنش واحد (Outbox Pattern) تا توزیع‌کننده مصرفش کنه.
  */
@@ -124,7 +124,7 @@ export class CargoPipelineService {
     this.logger.log(`✅ سفارش بار تشخیص داده شد [${label}] [${saved.code}]`);
   }
 
-  /** کد پیگیری بعدی: TRB + عدد sequence مشترک بین واتساپ و تلگرام. */
+  /** کد پیگیری بعدی: TRB + عدد sequence مشترک بین همه‌ی پلتفرم‌ها. */
   private async nextCargoCode(manager: EntityManager): Promise<string> {
     const [{ value }] = await manager.query(`SELECT nextval('cargo_code_seq') AS value`);
     return `TRB${value}`;

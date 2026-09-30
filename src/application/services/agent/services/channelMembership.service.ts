@@ -3,14 +3,15 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
 import { DataSource, EntityManager } from 'typeorm';
 import { MonitoredChannel } from '../entities/MonitoredChannel';
-import { TelegramMonitoredChannel } from '../entities/TelegramMonitoredChannel';
+import { AccountMonitoredChannelBase } from '../entities/AccountChannelBase';
 import { OutboxEvent } from '../entities/OutboxEvent';
 import { ChannelMembershipStatus } from '../types';
+import { ChannelPlatform } from '../common/channelMonitoring';
 
 export const CHANNEL_MEMBERSHIP_CHANGED = 'channel.membership.changed';
 
-type Platform = 'whatsapp' | 'telegram';
-type ChannelRecord = MonitoredChannel | TelegramMonitoredChannel;
+type Platform = ChannelPlatform;
+type ChannelRecord = MonitoredChannel | AccountMonitoredChannelBase;
 
 /**
  * قرارداد رویداد channel.membership.changed -- transport_backend با همین
@@ -55,7 +56,8 @@ export class ChannelMembershipService {
     channel.membershipStatus = status;
 
     await this.dataSource.transaction(async (manager) => {
-      await manager.save(platform === 'whatsapp' ? MonitoredChannel : TelegramMonitoredChannel, channel);
+      // channel نمونه‌ی entity همون پلتفرمه -- جدولش از روی کلاسش معلوم می‌شه.
+      await manager.save(channel);
       if (previousStatus !== status) {
         await this.insertEvent(manager, platform, channel, previousStatus, reason, channel.ownerUserIds);
       }
