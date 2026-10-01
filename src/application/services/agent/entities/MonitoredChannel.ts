@@ -13,8 +13,8 @@ export class MonitoredChannel {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  // برای کانال: کد دعوت بعد از channel/ در لینک (یا JID کامل xxxx@newsletter)
-  // برای گروه: کد دعوت بعد از chat.whatsapp.com/ در لینک (یا JID کامل xxxx@g.us)
+  // کد دعوت داخل لینک -- برای کانال بعد از channel/، برای گروه بعد از
+  // chat.whatsapp.com/. شناسه‌ی واقعی (JID) بعداً در resolvedJid ذخیره می‌شه.
   @Column({ unique: true })
   identifier: string;
 

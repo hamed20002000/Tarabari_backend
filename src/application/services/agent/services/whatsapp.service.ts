@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, IsNull, LessThanOrEqual, In, Not } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
@@ -6,6 +6,8 @@ import makeWASocket, {
   DisconnectReason,
   WASocket,
   WAMessage,
+  GroupParticipant,
+  areJidsSameUser,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
 } from '@whiskeysockets/baileys';
@@ -31,31 +33,54 @@ const DEFAULT_SESSION_ID = 'main';
 // (سفارش‌های بار تشخیص‌داده‌شده) مستقیماً بهش هم فرستاده می‌شن. از .env
 // خونده می‌شه -- اگه خالی باشه، این قابلیت به‌سادگی غیرفعال می‌مونه.
 const PERSONAL_NOTIFY_NUMBER = process.env.WHATSAPP_PERSONAL_NOTIFY_NUMBER || '';
+const PROFILE_NAME = 'باربری تارابری';
 
+// پایه‌ی همه‌ی خطاهای دسته‌بندی‌شده‌ی عضویت -- toJoinError دوباره دسته‌بندیشون نمی‌کنه.
+class WhatsappJoinError extends Error { }
 // درخواست عضویت ثبت شده و منتظر تایید ادمین گروهه.
-class WhatsappJoinPendingError extends Error { }
+class WhatsappJoinPendingError extends WhatsappJoinError { }
 // خطایی که با تلاش دوباره درست نمی‌شه (لینک نامعتبر/باطل، بن شدن).
-class WhatsappPermanentJoinError extends Error { }
+class WhatsappPermanentJoinError extends WhatsappJoinError { }
+// اتصال واتساپ قطعه یا درخواست timeout شد -- تقصیر گروه نیست و جزو تلاش‌ها حساب نمی‌شه.
+class WhatsappConnectionError extends WhatsappJoinError { }
+// واتساپ گفته درخواست‌ها زیاد شده (rate-overlimit) -- باید کلاً مدتی صبر کرد.
+class WhatsappRateLimitError extends WhatsappJoinError { }
 
 // کدهای HTTP که Baileys (Boom) برای خطاهای دائمی عضویت برمی‌گردونه.
 const PERMANENT_JOIN_STATUS: Record<number, string> = {
   400: 'لینک دعوت نامعتبره.',
-  401: 'ربات اجازه‌ی عضویت در این گروه/کانال رو نداره (احتمالاً حذف یا بن شده).',
+  401: 'ربات اجازه‌ی عضویت در این گروه/کانال رو نداره (لینک دعوت عوض شده، یا ربات قبلاً حذف یا بن شده).',
   403: 'ربات اجازه‌ی عضویت در این گروه/کانال رو نداره.',
   404: 'گروه/کانالی با این لینک پیدا نشد.',
   406: 'لینک دعوت نامعتبره.',
   410: 'لینک دعوت باطل یا منقضی شده.',
 };
 
+/**
+ * کد خطای واتساپ. خطاهای سمت سرور واتساپ (assertNodeErrorFree در Baileys)
+ * کد واقعی رو در data می‌ذارن و statusCode اونا همیشه 500ـه؛ خطاهای اتصال
+ * (Connection Closed، Timed Out) کد رو در output.statusCode دارن.
+ */
+function whatsappErrorCode(error: unknown): number | undefined {
+  const boom = error as Boom;
+  if (typeof boom?.data === 'number') return boom.data;
+  return boom?.output?.statusCode;
+}
+
 function toJoinError(error: unknown): Error {
-  if (error instanceof WhatsappPermanentJoinError || error instanceof WhatsappJoinPendingError) return error;
-  const status = (error as Boom)?.output?.statusCode;
+  if (error instanceof WhatsappJoinError) return error;
+  const status = whatsappErrorCode(error);
+  const message = (error as Error)?.message ?? String(error);
+  if (status === DisconnectReason.connectionClosed || status === DisconnectReason.timedOut) {
+    return new WhatsappConnectionError(`اتصال واتساپ برقرار نیست: ${message}`);
+  }
+  if (status === 429) return new WhatsappRateLimitError('واتساپ تعداد درخواست‌ها رو محدود کرد (rate-overlimit).');
   if (status && PERMANENT_JOIN_STATUS[status]) return new WhatsappPermanentJoinError(PERMANENT_JOIN_STATUS[status]);
-  return new Error(`عضویت ناموفق بود: ${(error as Error)?.message ?? String(error)}`);
+  return new WhatsappJoinError(`عضویت ناموفق بود: ${message}`);
 }
 
 @Injectable()
-export class WhatsappService implements OnModuleInit {
+export class WhatsappService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WhatsappService.name);
   private sock: WASocket | null = null;
 
@@ -68,16 +93,38 @@ export class WhatsappService implements OnModuleInit {
   // تکراری (redelivery واتساپ) به مدل رو می‌گیره.
   private readonly recentMessageIds = new RecentIdCache(1000);
 
-  // فاصله بین درخواست‌های فالو/جوین پشت‌سرهم -- جلوگیری از الگوی burst
-  // مشکوک وقتی چند گروه/کانال هم‌زمان در دیتابیس اضافه شدن.
+  // حداقل فاصله بین هر دو درخواست عضویت/استعلام لینک به واتساپ (به‌اضافه‌ی
+  // کمی تصادفی) -- جلوگیری از الگوی burst مشکوک که باعث مسدود شدن شماره می‌شه.
   private static readonly FOLLOW_DELAY_MS = 15000; // ۱۵ ثانیه
+  private static readonly FOLLOW_JITTER_MS = 10000; // تا ۱۰ ثانیه‌ی اضافه
+  // سقف عضویت (درخواست واقعی join/follow) در یک ساعت. باقی‌مونده‌ها در صف
+  // می‌مونن و دورهای بعدی انجام می‌شن.
+  private static readonly MAX_JOINS_PER_HOUR = 10;
+  // اگه واتساپ rate-overlimit داد، این مدت هیچ درخواست عضویتی فرستاده نمی‌شه.
+  private static readonly RATE_LIMIT_PAUSE_MINUTES = 60;
 
   // پارامترهای exponential backoff برای تلاش مجدد بعد از شکست.
   private static readonly BACKOFF_BASE_MINUTES = 5;
   private static readonly BACKOFF_MAX_MINUTES = 60;
   // بعد از این تعداد خطای موقت پشت‌سرهم، عضویت ناموفق اعلام و متوقف می‌شه.
   private static readonly MAX_JOIN_ATTEMPTS = 5;
+  // درخواست عضویتی که منتظر تایید ادمینه دوباره فرستاده نمی‌شه؛ فقط با این
+  // backoff بررسی می‌شه که عضو شدیم یا نه. بعد از این تعداد بررسی (حدوداً ۳
+  // روز با سقف ۶۰ دقیقه) ناموفق اعلام می‌شه.
+  private static readonly MAX_PENDING_CHECKS = 72;
+  // پیام‌های 'append' (رسیده در زمان قطعی) قدیمی‌تر از این پردازش نمی‌شن.
+  private static readonly MAX_APPEND_MESSAGE_AGE_MS = 60 * 60 * 1000;
   private isSyncingChannels = false;
+
+  // وضعیت واقعی اتصال -- this.sock بعد از قطع شدن هم null نمی‌شه.
+  private isConnected = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
+  private isShuttingDown = false;
+
+  private lastJoinRequestAt = 0;
+  private recentJoinTimes: number[] = [];
+  private joinsPausedUntil = 0;
 
   // بعد از اتصال، اگه PERSONAL_NOTIFY_NUMBER تنظیم شده باشه، JID
   // تاییدشده‌اش اینجا کش می‌شه.
@@ -98,7 +145,48 @@ export class WhatsappService implements OnModuleInit {
   ) { }
 
   async onModuleInit() {
-    await this.connect();
+    // استارت برنامه منتظر واتساپ نمی‌مونه؛ اگه اتصال اول fail بشه، دوباره تلاش می‌شه.
+    this.connect().catch((error) => {
+      this.logger.error('اتصال به واتساپ ناموفق بود', error as Error);
+      this.scheduleReconnect();
+    });
+  }
+
+  /**
+   * موقع خاموش شدن (و هر ری‌استارت --watch) سوکت بسته می‌شه. وگرنه پروسه‌ی
+   * قبلی و جدید چند لحظه هم‌زمان با یک نشست وصل می‌موندن -- واتساپ این رو
+   * conflict می‌بینه و تکرارش می‌تونه دستگاه رو از حساب جدا کنه.
+   */
+  onModuleDestroy(): void {
+    this.isShuttingDown = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    this.sock?.end(undefined);
+  }
+
+  /**
+   * اتصال مجدد با فاصله‌ی ۲، ۴، ۸ ... تا حداکثر ۶۰ ثانیه. اگه خود connect
+   * خطا بده (دیتابیس، شبکه)، دوباره زمان‌بندی می‌شه -- وگرنه برنامه تا
+   * ری‌استارت بعدی بی‌صدا از واتساپ جدا می‌موند.
+   */
+  private scheduleReconnect(immediate = false): void {
+    if (this.reconnectTimer || this.isShuttingDown) return;
+    const delayMs = immediate ? 0 : Math.min(2000 * 2 ** this.reconnectAttempts, 60000);
+    if (!immediate) this.reconnectAttempts += 1;
+    this.logger.warn(`اتصال مجدد واتساپ ${delayMs / 1000} ثانیه‌ی دیگه (تلاش #${this.reconnectAttempts})`);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect().catch((error) => {
+        this.logger.error('اتصال مجدد به واتساپ ناموفق بود', error as Error);
+        this.scheduleReconnect();
+      });
+    }, delayMs);
+  }
+
+  private async clearAuthState(): Promise<void> {
+    await this.keyRepo.delete({ sessionId: DEFAULT_SESSION_ID });
+    await this.credentialRepo.delete({ sessionId: DEFAULT_SESSION_ID });
   }
 
   private async connect(): Promise<void> {
@@ -108,12 +196,19 @@ export class WhatsappService implements OnModuleInit {
       this.keyRepo,
     );
 
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    this.logger.log(`نسخه‌ی Baileys: ${version.join('.')}، آخرین نسخه‌ست: ${isLatest}`);
+    // fetch داخل fetchLatestBaileysVersion مهلت نداره -- با شبکه‌ی کند اتصال گیر می‌کرد.
+    const { version, isLatest } = await Promise.race([
+      fetchLatestBaileysVersion(),
+      new Promise<Awaited<ReturnType<typeof fetchLatestBaileysVersion>>>((resolve) =>
+        setTimeout(() => resolve({ version: undefined as never, isLatest: false }), 10000),
+      ),
+    ]);
+    this.logger.log(`نسخه‌ی Baileys: ${version?.join('.') ?? 'پیش‌فرض'}، آخرین نسخه‌ست: ${isLatest}`);
 
     this.sock = makeWASocket({
       auth: state,
-      version,
+      // بدون version، نسخه‌ی پیش‌فرض خود Baileys استفاده می‌شه (undefined پیش‌فرض رو خراب می‌کرد).
+      ...(version ? { version } : {}),
       printQRInTerminal: false,
     });
 
@@ -127,21 +222,44 @@ export class WhatsappService implements OnModuleInit {
       }
 
       if (connection === 'close') {
+        this.isConnected = false;
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        this.logger.warn(`اتصال واتساپ قطع شد (کد ${statusCode}).`);
+        if (this.isShuttingDown) return;
 
-        this.logger.warn(`اتصال واتساپ قطع شد. اتصال مجدد انجام می‌شه: ${shouldReconnect}`);
-
-        if (shouldReconnect) {
-          this.connect();
+        if (statusCode === DisconnectReason.restartRequired) {
+          // بعد از اسکن QR واتساپ اتصال رو می‌بنده و انتظار داره فوراً دوباره
+          // وصل بشیم تا pairing کامل بشه -- تاخیر backoff اینجا باعث جدا شدن دستگاه می‌شد.
+          this.reconnectAttempts = 0;
+          this.scheduleReconnect(true);
+        } else if (statusCode === DisconnectReason.connectionReplaced) {
+          // یه پروسه‌ی دیگه با همین نشست وصل شده. اگه اینجا دوباره وصل بشیم،
+          // دو پروسه مدام همدیگه رو بیرون می‌کنن و واتساپ دستگاه رو logout می‌کنه.
+          this.logger.error(
+            'نشست واتساپ در پروسه‌ی دیگه‌ای باز شد (connectionReplaced) -- اتصال مجدد انجام نمی‌شه. فقط یک نمونه از برنامه اجرا کنید و ری‌استارت کنید.',
+          );
+        } else if (statusCode !== DisconnectReason.loggedOut) {
+          this.scheduleReconnect();
         } else {
-          this.logger.error('نشست بسته شد (loggedOut). QR جدید لازمه.');
+          // کلیدهای نشستِ logout‌شده دیگه به درد نمی‌خورن و با وجودشون هر
+          // اتصال دوباره هم 401 می‌گیره -- پاک می‌شن تا QR جدید نمایش داده بشه.
+          this.logger.error('نشست بسته شد (loggedOut). کلیدهای قبلی پاک می‌شن و QR جدید نمایش داده می‌شه.');
+          void this.clearAuthState()
+            .then(() => this.scheduleReconnect())
+            .catch((error) => this.logger.error('پاک کردن نشست واتساپ ناموفق بود', error as Error));
         }
       } else if (connection === 'open') {
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
         this.logger.log('اتصال واتساپ برقرار شد.');
-        void this.sock.updateProfileName('باربری تارابری').catch((err) =>
-          this.logger.error('پروفایل نیم تنظیم نشد', err),
-        );
+        // updateProfileName یه app-state patch می‌فرسته؛ روی نشستی که هنوز
+        // app-state رو sync نکرده سرور item-not-found برمی‌گردونه. خطاش
+        // بی‌خطره و اتصال کار می‌کنه، پس فقط وقتی اسم فرق داره تلاش می‌کنیم.
+        if (this.sock.user?.name !== PROFILE_NAME) {
+          void this.sock.updateProfileName(PROFILE_NAME).catch((err) =>
+            this.logger.warn(`پروفایل نیم تنظیم نشد: ${(err as Error).message}`),
+          );
+        }
 
         if (PERSONAL_NOTIFY_NUMBER) {
           this.resolvePersonalContact(PERSONAL_NOTIFY_NUMBER)
@@ -161,17 +279,15 @@ export class WhatsappService implements OnModuleInit {
     this.sock.ev.on('group-participants.update', async (update) => {
       const { id: groupJid, participants, action } = update;
 
-      if (action !== 'remove') return;
+      if (action !== 'add' && action !== 'remove') return;
+      if (!participants.some((p) => this.isMe(p))) return;
 
-      const myJid = this.sock?.user?.id;
-      if (!myJid) return;
-
-      const normalizedMyJid = myJid.split(':')[0];
-      const wasRemoved = participants.some(
-        (p) => p.id.split(':')[0] === normalizedMyJid,
-      );
-
-      if (!wasRemoved) return;
+      if (action === 'add') {
+        await this.onAddedToGroup(groupJid).catch((error) =>
+          this.logger.error(`ثبت عضویت گروه ناموفق بود: ${groupJid}`, error as Error),
+        );
+        return;
+      }
 
       this.logger.warn(`🚫 ربات از گروه حذف شد: ${groupJid}`);
 
@@ -185,17 +301,23 @@ export class WhatsappService implements OnModuleInit {
     });
 
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      // 'append' هم پیام جدیده: پیام‌هایی که موقع قطع بودن ربات رسیدن (offline)
+      // و پست‌های کانال که Baileys از مسیر notification می‌گیره با 'append' میان.
+      // فقط پیام‌های تازه پردازش می‌شن تا بارهای قدیمی دوباره اعلام نشن.
+      if (type !== 'notify' && type !== 'append') return;
 
       for (const msg of messages) {
         if (!msg.message) continue;
 
         const remoteJid = msg.key.remoteJid;
+        if (!remoteJid?.endsWith('@newsletter') && !remoteJid?.endsWith('@g.us')) continue;
 
-        if (remoteJid?.endsWith('@newsletter') || remoteJid?.endsWith('@g.us')) {
-          this.enqueueChannelMessage(msg);
-          continue;
+        if (type === 'append') {
+          const sentAtMs = Number(msg.messageTimestamp ?? 0) * 1000;
+          if (Date.now() - sentAtMs > WhatsappService.MAX_APPEND_MESSAGE_AGE_MS) continue;
         }
+
+        this.enqueueChannelMessage(msg);
       }
     });
   }
@@ -206,10 +328,11 @@ export class WhatsappService implements OnModuleInit {
 
   @Cron('*/2 * * * *')
   async syncMonitoredChannels(): Promise<void> {
-    if (!this.sock || !isChannelMonitoringEnabled('whatsapp') || this.isSyncingChannels) return;
+    if (!this.sock || !this.isConnected || !isChannelMonitoringEnabled('whatsapp') || this.isSyncingChannels) return;
+    if (Date.now() < this.joinsPausedUntil) return;
 
-    // جلوی اجرای هم‌زمان cron رو می‌گیره -- وگرنه با صف طولانی (۱۵ ثانیه
-    // فاصله برای هر گروه) یک گروه ممکن بود دو بار درخواست عضویت بگیره.
+    // جلوی اجرای هم‌زمان cron رو می‌گیره -- وگرنه با صف طولانی یک گروه
+    // ممکن بود دو بار درخواست عضویت بگیره.
     this.isSyncingChannels = true;
     try {
       const pendingChannels = await this.monitoredChannelRepo.find({
@@ -217,62 +340,126 @@ export class WhatsappService implements OnModuleInit {
           { isActive: true, isFollowed: false, nextAttemptAt: IsNull() },
           { isActive: true, isFollowed: false, nextAttemptAt: LessThanOrEqual(new Date()) },
         ],
+        order: { createdAt: 'ASC' },
       });
 
       if (pendingChannels.length === 0) return;
 
-      this.logger.log(`${pendingChannels.length} گروه/کانال جدید پیدا شد، در حال پردازش...`);
+      this.logger.log(`${pendingChannels.length} گروه/کانال در صف عضویت، در حال پردازش...`);
+
+      // یه کوئری برای همه: گروه‌هایی که ربات الان عضوشونه. با این، گروهی که
+      // ادمین تایید کرده یا قبلاً عضوش بودیم بدون درخواست دوباره JOINED می‌شه.
+      const joinedGroups = pendingChannels.some((c) => c.type === MonitoredChatType.GROUP)
+        ? new Set(Object.keys(await this.sock.groupFetchAllParticipating()))
+        : new Set<string>();
 
       for (const channel of pendingChannels) {
-        await this.joinMonitoredChannel(channel);
+        if (!this.isConnected || Date.now() < this.joinsPausedUntil) break;
+        const stop = await this.joinMonitoredChannel(channel, joinedGroups);
+        if (stop) break;
       }
+    } catch (error) {
+      this.logger.error('همگام‌سازی گروه/کانال‌های واتساپ ناموفق بود', error as Error);
     } finally {
       this.isSyncingChannels = false;
     }
   }
 
-  private async joinMonitoredChannel(channel: MonitoredChannel): Promise<void> {
+  /** @returns true اگه باید بقیه‌ی صف این دور متوقف بشه (قطعی اتصال، محدودیت واتساپ). */
+  private async joinMonitoredChannel(channel: MonitoredChannel, joinedGroups: Set<string>): Promise<boolean> {
     try {
       const resolvedJid =
         channel.type === MonitoredChatType.GROUP
-          ? await this.joinGroup(channel.identifier)
+          ? await this.joinGroup(channel, joinedGroups)
           : await this.followChannel(channel.identifier);
 
-      channel.resolvedJid = resolvedJid;
-      channel.isFollowed = true;
-      channel.lastError = null;
-      channel.retryCount = 0;
-      channel.nextAttemptAt = null;
-      await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.JOINED);
+      if (!resolvedJid) {
+        // سقف عضویت ساعتی پر شده -- رکورد دست نمی‌خوره و دور بعدی انجام می‌شه.
+        return true;
+      }
 
-      this.logger.log(
-        `${channel.type === MonitoredChatType.GROUP ? 'به گروه پیوست' : 'کانال دنبال شد'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, WhatsappService.FOLLOW_DELAY_MS));
-      return;
+      await this.markJoined(channel, resolvedJid);
+      return false;
     } catch (error) {
-      await this.handleJoinError(channel, error);
+      return this.handleJoinError(channel, toJoinError(error));
     }
   }
 
-  private async handleJoinError(channel: MonitoredChannel, error: unknown): Promise<void> {
-    channel.lastError = (error as Error)?.message ?? String(error);
+  private async markJoined(channel: MonitoredChannel, resolvedJid: string): Promise<void> {
+    channel.resolvedJid = resolvedJid;
+    channel.isFollowed = true;
+    channel.isActive = true;
+    channel.lastError = null;
+    channel.retryCount = 0;
+    channel.nextAttemptAt = null;
+    await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.JOINED);
+
+    this.logger.log(
+      `${channel.type === MonitoredChatType.GROUP ? 'به گروه پیوست' : 'کانال دنبال شد'}: ${resolvedJid} (${channel.label ?? channel.identifier})`,
+    );
+  }
+
+  /** ادمین درخواست رو تایید کرد یا کسی ربات رو به گروه اضافه کرد. */
+  private async onAddedToGroup(groupJid: string): Promise<void> {
+    this.logger.log(`✅ ربات به گروه اضافه شد: ${groupJid}`);
+    const channels = await this.monitoredChannelRepo.find({ where: { resolvedJid: groupJid, isFollowed: false } });
+    for (const channel of channels) {
+      await this.markJoined(channel, groupJid);
+    }
+    if (channels.length > 0) return;
+
+    // گروه‌های منتظر تاییدی که JIDشون هنوز معلوم نیست -- یکیشون احتمالاً همینه.
+    // بررسی بعدیشون جلو می‌افته تا با استعلام لینک (حالا که عضویم) پیدا بشه.
+    const unresolved = await this.monitoredChannelRepo.find({
+      where: { type: MonitoredChatType.GROUP, isFollowed: false, resolvedJid: IsNull() },
+    });
+    if (unresolved.length === 0) return;
+    for (const channel of unresolved) channel.nextAttemptAt = null;
+    await this.monitoredChannelRepo.save(unresolved);
+    void this.syncMonitoredChannels();
+  }
+
+  /** @returns true اگه باید بقیه‌ی صف این دور متوقف بشه. */
+  private async handleJoinError(channel: MonitoredChannel, error: Error): Promise<boolean> {
+    channel.lastError = error.message;
+
+    // قطعی اتصال: تقصیر گروه نیست -- تلاش حساب نمی‌شه و بعد از وصل شدن ادامه پیدا می‌کنه.
+    if (error instanceof WhatsappConnectionError) {
+      await this.monitoredChannelRepo.save(channel);
+      this.logger.warn(`عضویت ${channel.identifier} عقب افتاد: ${error.message}`);
+      return true;
+    }
+
+    // محدودیت واتساپ: کل عضویت‌ها یه مدت متوقف می‌شن تا شماره مسدود نشه.
+    if (error instanceof WhatsappRateLimitError) {
+      this.joinsPausedUntil = Date.now() + WhatsappService.RATE_LIMIT_PAUSE_MINUTES * 60 * 1000;
+      channel.nextAttemptAt = new Date(this.joinsPausedUntil);
+      await this.monitoredChannelRepo.save(channel);
+      this.logger.error(
+        `⛔ واتساپ محدودیت گذاشت -- عضویت‌ها ${WhatsappService.RATE_LIMIT_PAUSE_MINUTES} دقیقه متوقف شدن.`,
+      );
+      return true;
+    }
 
     const permanent = error instanceof WhatsappPermanentJoinError;
     const pending = error instanceof WhatsappJoinPendingError;
     channel.retryCount += 1;
 
-    // خطای دائمی، یا خطای موقتی که چند بار پشت‌سرهم تکرار شده -- دیگه تلاش نمی‌شه.
-    if (permanent || (!pending && channel.retryCount >= WhatsappService.MAX_JOIN_ATTEMPTS)) {
+    const exhausted = pending
+      ? channel.retryCount >= WhatsappService.MAX_PENDING_CHECKS
+      : channel.retryCount >= WhatsappService.MAX_JOIN_ATTEMPTS;
+
+    // خطای دائمی، خطای موقتی که چند بار تکرار شده، یا درخواستی که مدت‌ها
+    // تایید نشده -- دیگه تلاش نمی‌شه. با فعال‌سازی دوباره از پنل، از اول شروع می‌شه.
+    if (permanent || exhausted) {
+      if (pending) channel.lastError = 'ادمین گروه درخواست عضویت رو تایید نکرد.';
       channel.isActive = false;
       channel.nextAttemptAt = null;
       await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.FAILED, channel.lastError);
       this.logger.error(`عضویت ممکن نیست (${channel.type}): ${channel.identifier} -- ${channel.lastError}`);
-      return;
+      return false;
     }
 
-    // منتظر تایید ادمین: با همون backoff دوباره بررسی می‌شه تا تایید بشه.
     const backoffMinutes = exponentialBackoffMinutes(
       channel.retryCount,
       WhatsappService.BACKOFF_BASE_MINUTES,
@@ -282,14 +469,48 @@ export class WhatsappService implements OnModuleInit {
 
     if (pending) {
       await this.membership.transition('whatsapp', channel, ChannelMembershipStatus.PENDING, channel.lastError);
+      this.logger.log(`⏳ منتظر تایید ادمین: ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه بررسی می‌شه`);
     } else {
       await this.monitoredChannelRepo.save(channel);
+      this.logger.error(
+        `پردازش نشد (${channel.type}): ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه دوباره تلاش می‌شه (تلاش #${channel.retryCount})`,
+        error,
+      );
     }
+    return false;
+  }
 
-    this.logger.error(
-      `پردازش نشد (${channel.type}): ${channel.identifier} -- ${backoffMinutes} دقیقه‌ی دیگه دوباره تلاش می‌شه (تلاش #${channel.retryCount})`,
-      error as Error,
+  private isMe(participant: GroupParticipant): boolean {
+    const me = this.sock?.user;
+    if (!me) return false;
+    const myIds = [me.id, me.lid].filter((jid): jid is string => !!jid);
+    return [participant.id, participant.phoneNumber, participant.lid].some(
+      (jid) => !!jid && myIds.some((mine) => areJidsSameUser(jid, mine)),
     );
+  }
+
+  /**
+   * قبل از هر درخواست عضویت/استعلام لینک صدا زده می‌شه: فاصله‌ی حداقل
+   * FOLLOW_DELAY_MS (+ کمی تصادفی) از درخواست قبلی رو رعایت می‌کنه.
+   */
+  private async throttleJoinRequest(): Promise<void> {
+    const gap = WhatsappService.FOLLOW_DELAY_MS + Math.random() * WhatsappService.FOLLOW_JITTER_MS;
+    const waitMs = this.lastJoinRequestAt + gap - Date.now();
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    this.lastJoinRequestAt = Date.now();
+  }
+
+  private hasJoinQuota(): boolean {
+    const hourAgo = Date.now() - 60 * 60 * 1000;
+    this.recentJoinTimes = this.recentJoinTimes.filter((time) => time > hourAgo);
+    return this.recentJoinTimes.length < WhatsappService.MAX_JOINS_PER_HOUR;
+  }
+
+  /** سهمیه‌ی عضویت ساعتی رو چک و در صورت امکان مصرف می‌کنه. */
+  private takeJoinQuota(): boolean {
+    if (!this.hasJoinQuota()) return false;
+    this.recentJoinTimes.push(Date.now());
+    return true;
   }
 
   private isLikelyMobileNumber(rawNumber: string): boolean {
@@ -334,15 +555,23 @@ export class WhatsappService implements OnModuleInit {
     return results[0].jid ?? `${digits}@s.whatsapp.net`;
   }
 
-  private async followChannel(identifier: string): Promise<string> {
+  private async followChannel(identifier: string): Promise<string | null> {
     if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
 
     try {
-      const metadata = identifier.endsWith('@newsletter')
-        ? { id: identifier }
-        : await this.sock.newsletterMetadata('invite', identifier);
+      // سهمیه پر باشه، استعلام هم انجام نمی‌شه (وگرنه هر دور cron یه استعلام بی‌فایده می‌رفت).
+      if (!this.hasJoinQuota()) return null;
+
+      await this.throttleJoinRequest();
+      const metadata = await this.sock.newsletterMetadata('invite', identifier);
       if (!metadata?.id) throw new WhatsappPermanentJoinError('کانالی با این لینک پیدا نشد.');
 
+      // اگه قبلاً دنبالش کردیم (یا ادمینشیم)، درخواست follow دوباره نمی‌ره.
+      const role = (metadata as { viewer_metadata?: { role?: string } }).viewer_metadata?.role;
+      if (role && role !== 'GUEST') return metadata.id;
+
+      if (!this.takeJoinQuota()) return null;
+      await this.throttleJoinRequest();
       await this.sock.newsletterFollow(metadata.id);
       return metadata.id;
     } catch (error) {
@@ -350,15 +579,49 @@ export class WhatsappService implements OnModuleInit {
     }
   }
 
-  private async joinGroup(identifier: string): Promise<string> {
-    if (!this.sock) throw new Error('سوکت واتساپ آماده نیست.');
-
-    if (identifier.endsWith('@g.us')) {
-      return identifier;
-    }
+  /**
+   * عضویت در گروه با کمترین درخواست ممکن به واتساپ:
+   *   ۱. JID گروه با استعلام لینک (بدون عضویت) پیدا و ذخیره می‌شه.
+   *   ۲. اگه ربات همین الان عضوه (تایید ادمین، عضویت قبلی) -- درخواستی نمی‌ره.
+   *   ۳. اگه قبلاً درخواست داده شده و منتظر تاییده -- دوباره فرستاده نمی‌شه.
+   *   ۴. فقط در غیر این صورت درخواست عضویت فرستاده می‌شه.
+   * @returns JID گروه، یا null اگه سقف عضویت ساعتی پر شده.
+   */
+  private async joinGroup(channel: MonitoredChannel, joinedGroups: Set<string>): Promise<string | null> {
+    if (!this.sock) throw new WhatsappConnectionError('سوکت واتساپ آماده نیست.');
 
     try {
-      const result = await this.sock.groupAcceptInvite(identifier);
+      if (!channel.resolvedJid) {
+        await this.throttleJoinRequest();
+        const info = await this.sock.groupGetInviteInfo(channel.identifier).catch((error: Boom) => {
+          // واتساپ برای گروهی که قبلاً درخواست عضویتش داده شده و منتظر تاییده،
+          // به‌جای اطلاعات گروه جواب دیگه‌ای برمی‌گردونه. درخواست دوباره
+          // فرستاده نمی‌شه؛ بعد از تایید، استعلام لینک جواب می‌ده.
+          if (error?.message?.startsWith('Invalid group metadata response')) {
+            this.logger.warn(
+              `استعلام لینک ${channel.identifier} اطلاعات گروه نداد: ${JSON.stringify(error.data)?.slice(0, 1000)}`,
+            );
+            throw new WhatsappJoinPendingError(
+              'واتساپ اطلاعات گروه رو نداد -- احتمالاً درخواست عضویت قبلی هنوز منتظر تایید ادمین گروهه.',
+            );
+          }
+          throw error;
+        });
+        if (!info?.id) throw new WhatsappPermanentJoinError('گروهی با این لینک پیدا نشد.');
+        channel.resolvedJid = info.id;
+        await this.monitoredChannelRepo.save(channel);
+      }
+
+      if (joinedGroups.has(channel.resolvedJid)) return channel.resolvedJid;
+
+      if (channel.membershipStatus === ChannelMembershipStatus.PENDING) {
+        throw new WhatsappJoinPendingError('درخواست عضویت قبلاً فرستاده شده و منتظر تایید ادمین گروهه.');
+      }
+
+      if (!this.takeJoinQuota()) return null;
+
+      await this.throttleJoinRequest();
+      const result = await this.sock.groupAcceptInvite(channel.identifier);
 
       // گروهی که تایید ادمین لازم داره jid برنمی‌گردونه -- درخواست ثبت شده.
       if (!result || typeof result !== 'string') {
@@ -367,9 +630,11 @@ export class WhatsappService implements OnModuleInit {
 
       return result;
     } catch (error) {
-      if (error instanceof WhatsappJoinPendingError) throw error;
+      // 409: ربات از قبل عضو گروهه.
+      if (whatsappErrorCode(error) === 409 && channel.resolvedJid) return channel.resolvedJid;
+      if (!(error instanceof Error) || !('isBoom' in error)) throw error;
       this.logger.error(
-        `جزئیات خام خطای groupAcceptInvite: ${JSON.stringify(error, Object.getOwnPropertyNames(error as object))}`,
+        `جزئیات خام خطای عضویت گروه: ${JSON.stringify(error, Object.getOwnPropertyNames(error as object))}`,
       );
       throw toJoinError(error);
     }

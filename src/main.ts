@@ -78,6 +78,10 @@ async function bootstrap() {
   // Apply global pipes, interceptors, and filters
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
 
+  // روی SIGTERM/SIGINT (مثلاً ری‌استارت --watch) onModuleDestroy اجرا می‌شه تا
+  // اتصال واتساپ قبل از بالا اومدن پروسه‌ی جدید بسته بشه.
+  app.enableShutdownHooks();
+
   await app.listen(process.env.PORT ?? 3333);
   logger.log(`برنامه روی آدرس ${await app.getUrl()} در حال اجراست`);
 }
