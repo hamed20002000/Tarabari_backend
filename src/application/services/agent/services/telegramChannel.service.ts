@@ -4,7 +4,7 @@ import { Repository } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
 import { TelegramClient, Api, utils } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { NewMessage, NewMessageEvent } from 'telegram/events';
+import { NewMessage, NewMessageEvent, Raw } from 'telegram/events';
 import { FloodWaitError, RPCError } from 'telegram/errors';
 import { LogLevel } from 'telegram/extensions/Logger';
 import { TelegramMonitoredChannel } from '../entities/TelegramMonitoredChannel';
@@ -44,6 +44,9 @@ const PERMANENT_JOIN_ERRORS: Record<string, string> = {
 @Injectable()
 export class TelegramChannelService extends AccountChannelMonitor<TelegramMonitoredChannel, TelegramChannelMessage> {
   private client: TelegramClient | null = null;
+  private myId: string | null = null;
+  // آخرین بررسی عضویت هر کانال بعد از UpdateChannel -- جلوی استعلام‌های پشت‌سرهم رو می‌گیره.
+  private readonly lastRemovalCheckAt = new Map<string, number>();
 
   constructor(
     @InjectRepository(TelegramMonitoredChannel)
@@ -68,20 +71,28 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
   }
 
   protected async connect(session: string): Promise<void> {
+
+    //#region ----------------- برای استخراج api_idو api_hash ------------------
     const credentials = getTelegramApiCredentials();
     if (!credentials) {
       this.logger.warn('TELEGRAM_API_ID/TELEGRAM_API_HASH تعریف نشده -- مانیتورینگ تلگرام غیرفعاله.');
       return;
     }
+    //#endregion ----------------------------------------------------------------
 
+    //#region ----------------- ساختن نمونه ای از تگرام اکانت --------------------
     const client = new TelegramClient(
       new StringSession(session),
       credentials.apiId,
       credentials.apiHash,
       buildTelegramClientParams(),
     );
-    client.setLogLevel(LogLevel.ERROR);
 
+    //#endregion ------------------------------------------------------------------
+
+    client.setLogLevel(LogLevel.ERROR);// برای جلوگیری از جاپ های بی مورد الان فقط خطاها تو کنسول نشون داده میشن
+
+    //#region ------------------ اتصال به تلگرام -------------------
     await client.connect();
 
     if (!(await client.checkAuthorization())) {
@@ -89,46 +100,74 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
       await client.disconnect();
       return;
     }
+    //#endregion -----------------------------------------------------
 
-    // اگه کلید نشست عوض شده باشه (مثلاً انتقال به دیتاسنتر دیگه)، نسخه‌ی جدید ذخیره می‌شه.
+    //#region ------------------ بررسی اینکه ایا نشست اکانت ما تغییر کرده یا نه مثل  اکانت ما به دیتاسنتر دیگه بره ------
     const savedSession = client.session.save() as unknown as string;
     if (savedSession && savedSession !== session) {
       await this.updateSession(savedSession);
     }
 
+    //#endregion -------------------------------------------------------------------------------------------------------------
+
+
+    //#region ------------------- تعریف هنادلر برای دریافت پیغام جدید ---------------
     client.addEventHandler(
       (event: NewMessageEvent) => this.onNewMessage(event),
       new NewMessage({ incoming: true }),
     );
+    //#endregion ---------------------------------------------------------------------
 
+
+    //#region ------------------- برای مواقعی که از گروه حذفمون کردن یا مسدود شدیم ----
+    client.addEventHandler(
+      (update: Api.TypeUpdate) => void this.onMembershipUpdate(update),
+      new Raw({ types: [Api.UpdateChannel, Api.UpdateNewMessage, Api.UpdateNewChannelMessage] }),
+    );
+    //#endregion ------------------------------------------------------------------------
+
+
+    //#region -------------------- به دست آوردن اطلاعات حساب کاربری مانند شناسه و نام و نام کاربری------
     const me = await client.getMe();
-    // مثل یک کلاینت واقعی، لیست گفتگوها رو یک بار می‌گیره -- هم کش entityها
-    // پر می‌شه و هم تلگرام آپدیت‌های کانال‌ها رو برای این نشست می‌فرسته.
-    await client.getDialogs({ limit: 100 });
+    this.myId = me.id.toString();
+    //#endregion ---------------------------------------------------------------------------------------
 
-    this.client = client;
+    //#region -------------------- به دست آوردن لیست کاربران عضو اکانتی که با اون وصل شدیم مثل تلگرام واقعی -----
+    await client.getDialogs({ limit: 100 });
+    //#endregion ------------------------------------------------------------------------------------------------
+
+
+    this.client = client;//اطلاعات اکانت رو در فیلد کلاس ذخیره میکنیم
     this.logger.log(`اکانت تلگرام متصل شد: ${me.username ? '@' + me.username : me.id.toString()}`);
   }
 
   private onNewMessage(event: NewMessageEvent): void {
+
+    //#region ------------------- اگر پیام خصوصی بود یا پیام نداشتیم از ادامه کار صرف نظر میکنیم -------------------
     const msg = event.message;
     if (!msg || event.isPrivate) return;
 
     const text = (msg.message || '').trim();
     const isVoice = !text && !!msg.voice;
     if (!text && !isVoice) return;
+    //#endregion ---------------------------------------------------------------------------------------------
 
+    //#region -------------------- به دست آوردن شناسه گروه/کانال -------------------
     let chatId: string;
     try {
       chatId = utils.getPeerId(msg.peerId);
     } catch {
       return;
     }
+    //#endregion -------------------------------------------------------------------
 
+    //#region -------------------- اگه پیام صوتی بود اطلاعاتش رو به دستمیاریم مانند زمانو عنوان و ... -----
     const audioAttr = msg.voice?.attributes.find(
       (attr): attr is Api.DocumentAttributeAudio => attr instanceof Api.DocumentAttributeAudio,
     );
+    //#endregion ------------------------------------------------------------------------------------------
 
+    //#region -------------------- پیام رو در صف پردازش قرار میدیم -------------------
     this.enqueueMessage({
       chatId,
       messageId: msg.id,
@@ -144,10 +183,69 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
         }
         : undefined,
     });
+    //#endregion -------------------------------------------------------------------
   }
 
-  // GramJS گاهی بعد از مدت طولانی بی‌کاری دریافت آپدیت‌های کانال رو متوقف
-  // می‌کنه؛ یک درخواست سبک دوره‌ای اتصال آپدیت‌ها رو زنده نگه می‌داره.
+  /**
+   * گروه معمولی: پیام سیستمی «X، اکانت ما رو حذف کرد» میاد.
+   * سوپرگروه/کانال: فقط UpdateChannel میاد (که برای تغییر اسم و ... هم میاد) --
+   * برای همین فقط کانال‌هایی که عضوشون هستیم، و هر کدوم حداکثر ۱۰ دقیقه یک بار، استعلام می‌شن.
+   */
+  private async onMembershipUpdate(update: Api.TypeUpdate): Promise<void> {
+    try {
+
+      //#region -------------------- بررسی حذف شدن از گروه یا کانال -------------------
+
+      // وقتی کاربری از کانال حذف یا اضفه میشه و در کل اتفاقی در کانال یا  گروه میفته پغام ارسال میشه از طرف کانال اینجا اکه 
+      // پیغام جدید بود یا پیغام سوپر کانال بود رو بررسی میکنیم
+      if (update instanceof Api.UpdateNewMessage || update instanceof Api.UpdateNewChannelMessage) {
+        const msg = update.message;
+        if (
+          msg instanceof Api.MessageService &&
+          msg.action instanceof Api.MessageActionChatDeleteUser &&
+          msg.action.userId.toString() === this.myId
+        ) {
+          await this.markRemoved(utils.getPeerId(msg.peerId), 'اکانت از گروه تلگرام حذف شد (kicked/removed).');
+        }
+        return;
+      }
+      //#endregion ---------------------------------------------------------------------
+
+      // از شرط اتثال کوتاه استفاده شده تا از نوشتن بدنه اصلی کد در if جلوگیری بشی در حقیقت نخواسته از if elseاستفاده کنه برای شرط درست
+      if (!(update instanceof Api.UpdateChannel) || !this.client) return;
+
+      //#region ------------------------- به دست اوردن ایدی کانال -------------------------
+      const chatId = utils.getPeerId(new Api.PeerChannel({ channelId: update.channelId }));
+      //#endregion -------------------------------------------------------------------------
+
+      //#region ------------------------- بررسی اینکه آیا قبلا این کانال رو برای حذف شدن از گروه یا کانال بررسی کردم تا دیگه بررسی نکنم-----
+      const lastCheck = this.lastRemovalCheckAt.get(chatId) ?? 0;
+      if (Date.now() - lastCheck < 10 * 60_000) return;
+      const isMember = await this.channelRepo.exists({ where: { chatId, isMember: true } });
+      if (!isMember) return;
+      this.lastRemovalCheckAt.set(chatId, Date.now());
+      //#endregion ----------------------------------------------------------------------------
+
+      //#region ------------------------- بررسی اینکه آیای من خودم در این کانال هستم یا نه------ 
+      try {
+        await this.client.invoke(
+          new Api.channels.GetParticipant({ channel: chatId, participant: new Api.InputPeerSelf() }),
+        );
+      } catch (error) {
+        const code = error instanceof RPCError ? error.errorMessage : null;
+        if (code === 'USER_NOT_PARTICIPANT' || code === 'CHANNEL_PRIVATE') {
+          await this.markRemoved(chatId, 'اکانت از گروه/کانال تلگرام حذف یا بن شد.');
+        } else {
+          throw error;
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`بررسی حذف از گروه/کانال تلگرام ناموفق بود: ${(error as Error).message}`);
+    }
+    //#endregion ---------------------------------------------------------------------------------
+  }
+
+  //#region -------------- GramJS گاهی بعد از مدت طولانی بی‌کاری دریافت آپدیت‌های کانال رو متوقف  می‌کنه؛ یک درخواست سبک دوره‌ای اتصال آپدیت‌ها رو زنده نگه می‌داره.------
   @Cron('*/5 * * * *')
   async keepUpdatesAlive(): Promise<void> {
     if (!this.client) return;
@@ -157,8 +255,13 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
       this.logger.warn(`keep-alive تلگرام ناموفق بود: ${(error as Error).message}`);
     }
   }
+  //#endregion ------------------------------------------------------------------------------------------------------------------------------------------------------
 
+
+
+  //#region ---------------- اکانت Telegram را وارد یک گروه/کانال کند و خطایی رخ می‌دهد، تصمیم بگیرد با آن خطا چه برخوردی شود --------
   protected classifyJoinError(error: unknown): JoinErrorDecision {
+
     if (error instanceof FloodWaitError) {
       return {
         kind: 'pause',
@@ -182,21 +285,34 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
 
     return { kind: 'retry' };
   }
+  //#endregion -----------------------------------------------------------------------------------------------------------------------
 
   // ------------------------------------------------------------------
   // فراخوانی‌های تلگرام
   // ------------------------------------------------------------------
 
+
+  //#region ------------------------------ join شدن به گروه -----------------------------
   protected async join(identifier: string): Promise<JoinResult> {
+
+
     const client = this.client!;
     const parsed = TelegramChannelService.parseIdentifier(identifier);
 
+    //#region --------------------------- لینک دعوت داریم--------------------------------------
     if (parsed.kind === 'invite') {
+
+      //#region ------------------------ اطلاعات لینک دعوت رو به دست میاریم -----------------------
       const invite = await client.invoke(new Api.messages.CheckChatInvite({ hash: parsed.hash }));
+      //#endregion -------------------------------------------------------------------------------
+
+      //#region ------------------------- قبل عضو بودیم -------------------------------------------
       if (invite instanceof Api.ChatInviteAlready) {
         return this.fromChat(invite.chat, false);
       }
+      //#endregion ---------------------------------------------------------------------------------
 
+      //#region -------------------------- ساخت اطلاعات اولیه از گروه یا کانال که هنوز عضو نیستیم ---
       const preview: JoinResult =
         invite instanceof Api.ChatInvite
           ? {
@@ -206,35 +322,49 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
             pending: false,
           }
           : this.fromChat(invite.chat, false);
+      //#endregion ------------------------------------------------------------------------------------
 
       // مثل کاربر واقعی: اول پیش‌نمایش، بعد چند ثانیه مکث، بعد عضویت.
       await sleep(randomBetween(3_000, 8_000));
 
       try {
+
+        //#region ------------------------ درخواست عضویت ------------------------------------------------
         const updates = await client.invoke(new Api.messages.ImportChatInvite({ hash: parsed.hash }));
-        const chat = this.firstChat(updates);
+        //#endregion ------------------------------------------------------------------------------------
+
+        //#region ------------------------- به دست اورد اطلاعات کانال یا گروه که عضوشدیم ------------------
+        const chat = this.firstChat(updates);// کانال یا گروه رو به دست میاریم
         if (chat) return this.fromChat(chat, false);
+        //#endregion --------------------------------------------------------------------------------------
+
+
       } catch (error) {
         const code = error instanceof RPCError ? error.errorMessage : null;
         if (code === 'INVITE_REQUEST_SENT') return { ...preview, pending: true };
         if (code !== 'USER_ALREADY_PARTICIPANT') throw error;
       }
 
-      // عضو هستیم ولی chatId تو جواب نبود -- از خود لینک می‌گیریم.
+      // چون در این لحظه قبلا درخواست عضویت دادیم اینبار شاید اطلعات chat زو بده 
+      //چون  یا joinشدیم یت در انتظار تاپید هستیم
       const again = await client.invoke(new Api.messages.CheckChatInvite({ hash: parsed.hash }));
       if (again instanceof Api.ChatInviteAlready) return this.fromChat(again.chat, false);
       throw new Error('عضویت انجام شد ولی شناسه‌ی گروه/کانال به دست نیومد.');
     }
+    //#endregion -------------------------------------------------------------------------------
+
+
+    //#region ----------------------------- کانال یا گروهی که usernamerعمومی دارد ---------------
 
     const entity = await client.getEntity(parsed.username);
-    if (!(entity instanceof Api.Channel)) {
+    if (!(entity instanceof Api.Channel)) {// این بررسی هم برای کانال هست هم سوپر گروه(الان همه گروه های تلگرام سوپر گروه هستند)
       throw new PermanentJoinError('این آیدی مربوط به گروه/کانال نیست.');
     }
 
     await sleep(randomBetween(3_000, 8_000));
 
     try {
-      await client.invoke(new Api.channels.JoinChannel({ channel: entity }));
+      await client.invoke(new Api.channels.JoinChannel({ channel: entity }));// join هم برای کانال هست و هم برای سوپر گروه
     } catch (error) {
       const code = error instanceof RPCError ? error.errorMessage : null;
       if (code === 'INVITE_REQUEST_SENT') return this.fromChat(entity, true);
@@ -242,9 +372,12 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
     }
 
     return this.fromChat(entity, false);
+    //#endregion --------------------------------------------------------------------------------------
   }
+  //#endregion ---------------------------------------------------------------------------
 
   protected async checkMembership(identifier: string): Promise<JoinResult | null> {
+    
     const client = this.client!;
     const parsed = TelegramChannelService.parseIdentifier(identifier);
 
@@ -267,11 +400,14 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
     }
   }
 
+  //#region ---------------------------- به دست آوردن اولین کانال یا گروه برای عضویت -----------
   private firstChat(updates: Api.TypeUpdates): Api.TypeChat | null {
     if ('chats' in updates && updates.chats.length > 0) return updates.chats[0];
     return null;
   }
+  //#endregion --------------------------------------------------------------------------------
 
+  //#region -------------------- استخراج اطلاعات گروه و یا کانال -----------------------
   private fromChat(chat: Api.TypeChat, pending: boolean): JoinResult {
     return {
       chatId: utils.getPeerId(chat),
@@ -283,7 +419,9 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
       pending,
     };
   }
+  //#endregion ---------------------------------------------------------------------------
 
+  //#region -------------------- تجزیه شناسه گروه/کانال تلگرام -----------------------
   /**
    * لینک خصوصی: t.me/+HASH، t.me/joinchat/HASH یا +HASH
    * لینک عمومی: t.me/username، @username یا username
@@ -307,6 +445,7 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
 
     throw new PermanentJoinError('فرمت لینک نامعتبره.');
   }
+  //#endregion -------------------------------------------------------------------------------
 
   /**
    * شکل یکتای لینک برای ذخیره در identifier -- تا لینک‌های مختلفِ یک

@@ -196,12 +196,13 @@ export abstract class AccountChannelMonitor<
   // دریافت پیام‌ها
   // ------------------------------------------------------------------
 
+  //#region -------------------- صف بندی کردن عملیات برای کروه ها و کانال ها --------------
   protected enqueueMessage(message: IncomingChatMessage): void {
-    // پیام‌ها یکی‌یکی پردازش می‌شن -- جلوگیری از درخواست‌های هم‌زمان به Ollama.
     void this.messageQueue.run(() => this.handleChatMessage(message)).catch((error) =>
       this.logger.error(`خطا در پردازش پیام گروه/کانال ${this.platform}: ${message.chatId}`, error as Error),
     );
   }
+  //#endregion -----------------------------------------------------------------------------
 
   /**
    * پردازش یک پیام جدید از گروه یا کانال: تشخیص سفارش بار، و فقط برای سفارش
@@ -209,6 +210,7 @@ export abstract class AccountChannelMonitor<
    * Outbox Pattern برای توزیع‌کننده.
    */
   private async handleChatMessage({ chatId, messageId, text, voice }: IncomingChatMessage): Promise<void> {
+    
     const key = `${chatId}:${messageId}`;
     const label = `${this.platform} ${key}`;
     if (this.recentMessageKeys.has(key)) return;
@@ -397,6 +399,23 @@ export abstract class AccountChannelMonitor<
       channel.nextAttemptAt = null;
       this.logger.log(`✅ عضو گروه/کانال ${this.platform} شد: ${channel.chatId} (${channel.label ?? channel.identifier})`);
       await this.membership.transition(this.platform, channel, ChannelMembershipStatus.JOINED);
+    }
+  }
+
+  /**
+   * اکانت از گروه/کانال حذف (kick/ban) شد -- مثل واتساپ رکورد غیرفعال و به
+   * ثبت‌کننده‌ها اعلام می‌شه؛ با فعال‌سازی دوباره از پنل، از اول عضو می‌شه.
+   */
+  protected async markRemoved(chatId: string, reason: string): Promise<void> {
+    const channels = await this.channelRepo.find({ where: { chatId, isMember: true } as FindOptionsWhere<C> });
+    for (const channel of channels) {
+      channel.isActive = false;
+      channel.isMember = false;
+      channel.joinRequestPending = false;
+      channel.nextAttemptAt = null;
+      channel.lastError = reason;
+      await this.membership.transition(this.platform, channel, ChannelMembershipStatus.REMOVED, reason);
+      this.logger.warn(`🚫 اکانت ${this.platform} از گروه/کانال حذف شد: ${chatId} (${channel.label ?? channel.identifier})`);
     }
   }
 
