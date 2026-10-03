@@ -77,12 +77,16 @@ export class BaleChannelService extends AccountChannelMonitor<BaleMonitoredChann
     });
 
     // run تا قطع اتصال (یا خطای اتصال) برنمی‌گرده -- بعدش دوباره وصل می‌شیم.
-    void client.run().finally(() => {
-      this.client = null;
-      if (this.stopped) return;
-      this.logger.warn(`اتصال بله قطع شد -- ${RECONNECT_DELAY_MS / 1000} ثانیه‌ی دیگه دوباره وصل می‌شه.`);
-      this.reconnectTimer = setTimeout(() => void this.connect(session), RECONNECT_DELAY_MS);
-    });
+    // catch لازمه -- finally خطا رو دوباره پرتاب می‌کنه و unhandled rejection پروسه رو می‌بست.
+    void client
+      .run()
+      .catch((error) => this.logger.error('اتصال بله با خطا تموم شد', error as Error))
+      .finally(() => {
+        this.client = null;
+        if (this.stopped) return;
+        this.logger.warn(`اتصال بله قطع شد -- ${RECONNECT_DELAY_MS / 1000} ثانیه‌ی دیگه دوباره وصل می‌شه.`);
+        this.reconnectTimer = setTimeout(() => void this.connect(session), RECONNECT_DELAY_MS);
+      });
   }
 
   private onMessage(message: BaleMessage): void {

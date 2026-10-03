@@ -26,6 +26,7 @@ import { SerialTaskQueue } from '../common/serialTaskQueue';
 import { RecentIdCache } from '../common/recentIdCache';
 import { exponentialBackoffMinutes } from '../common/backoff';
 import { isChannelMonitoringEnabled } from '../common/channelMonitoring';
+import { HAS_OWNERS } from '../common/channelOwners';
 
 const DEFAULT_SESSION_ID = 'main';
 
@@ -337,8 +338,9 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     try {
       const pendingChannels = await this.monitoredChannelRepo.find({
         where: [
-          { isActive: true, isFollowed: false, nextAttemptAt: IsNull() },
-          { isActive: true, isFollowed: false, nextAttemptAt: LessThanOrEqual(new Date()) },
+          // بدون ثبت‌کننده (همه حذفش کردن) عضو نمی‌شیم -- با ثبت دوباره خودبه‌خود در صف میاد.
+          { isActive: true, isFollowed: false, nextAttemptAt: IsNull(), ownerUserIds: HAS_OWNERS },
+          { isActive: true, isFollowed: false, nextAttemptAt: LessThanOrEqual(new Date()), ownerUserIds: HAS_OWNERS },
         ],
         order: { createdAt: 'ASC' },
       });
@@ -660,6 +662,20 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     if (!messageId) return;
     if (this.recentMessageIds.has(messageId)) return;
 
+    // فقط گروه/کانال‌های ثبت‌شده‌ی فعالِ منبع که حداقل یک ثبت‌کننده دارن (مثل
+    // بقیه‌ی پلتفرم‌ها) -- وگرنه پیام هر گروهی که اکانت توشه به تبدیل صدا و مدل می‌رفت.
+    // ownerUserIds همین رکورد در payload رویداد می‌ره تا اعلان بار به همون کاربرها برسه.
+    const channel = await this.monitoredChannelRepo.findOne({
+      where: {
+        resolvedJid: channelJid,
+        isActive: true,
+        role: In([MonitoredChannelRole.SOURCE, MonitoredChannelRole.BOTH]),
+        ownerUserIds: HAS_OWNERS,
+      },
+      select: { id: true, ownerUserIds: true },
+    });
+    if (!channel) return;
+
     const existing = await this.channelMessageRepo.findOne({ where: { messageId } });
     if (existing) return;
 
@@ -686,12 +702,6 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       if (!text) return;
     }
 
-    // کاربری که این گروه/کانال رو ثبت کرده -- اعلان بار برای همون کاربر فرستاده می‌شه.
-    const channel = await this.monitoredChannelRepo.findOne({
-      where: { resolvedJid: channelJid },
-      select: { id: true, ownerUserIds: true },
-    });
-
     const extraction = await this.cargoPipeline.process({
       label: `${channelJid} ${messageId}`,
       text,
@@ -699,7 +709,7 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       entity: WhatsappChannelMessage,
       record: { channelJid, messageId, isCargoOrder: true },
       source: { platform: 'whatsapp', channelJid },
-      ownerUserIds: channel?.ownerUserIds ?? [],
+      ownerUserIds: channel.ownerUserIds,
     });
     if (!extraction) return;
 

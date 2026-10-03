@@ -22,9 +22,9 @@ export abstract class AccountMonitoredChannelBase {
   @Column({ type: 'enum', enum: MonitoredChannelRole, default: MonitoredChannelRole.SOURCE })
   role: MonitoredChannelRole;
 
-  // کاربرهایی که این گروه/کانال رو ثبت کردن. پیام‌ها همیشه پردازش می‌شن،
-  // ولی اعلان و نمایش پیام‌های بارِ این گروه/کانال فقط برای همین کاربرهاست
-  // (ownerUserIds در payload رویداد). ایندکس GIN در مایگریشن ساخته شده.
+  // کاربرهایی که این گروه/کانال رو ثبت کردن -- اعلان و نمایش بارها فقط برای
+  // همین‌هاست (ownerUserIds در payload رویداد). بدون ثبت‌کننده، نه عضو می‌شیم و
+  // نه پیامش پردازش می‌شه (HAS_OWNERS). ایندکس GIN در مایگریشن ساخته شده.
   @Column('text', { array: true, default: () => "'{}'" })
   ownerUserIds: string[];
 
@@ -63,6 +63,11 @@ export abstract class AccountMonitoredChannelBase {
   // (رویداد channel.membership.changed) به ثبت‌کننده‌ها اعلام می‌شه.
   @Column({ type: 'varchar', length: 20, default: ChannelMembershipStatus.QUEUED })
   membershipStatus: ChannelMembershipStatus;
+
+  // بعد از عضویت معلوم شد همون گروه/کانالِ رکورد دیگه‌ایه (با لینک متفاوت) --
+  // این رکورد غیرفعاله و ثبت بعدیِ همین لینک مستقیم به اون رکورد اضافه می‌شه.
+  @Column({ type: 'uuid', nullable: true })
+  mergedIntoId: string | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;

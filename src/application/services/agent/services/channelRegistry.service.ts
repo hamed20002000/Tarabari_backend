@@ -16,6 +16,7 @@ import { AccountPlatform, CHANNEL_PLATFORMS, ChannelPlatform } from '../common/c
 import { TelegramChannelService } from './telegramChannel.service';
 import { BaleChannelService } from './baleChannel.service';
 import { RubikaChannelService } from './rubikaChannel.service';
+import { addChannelOwner, isUniqueViolation, removeChannelOwner } from '../common/channelOwners';
 
 export { CHANNEL_PLATFORMS, ChannelPlatform };
 
@@ -166,31 +167,9 @@ export class ChannelRegistryService {
 
     const repo = this.channelRepos[parsed.platform];
     // رکوردهای قدیمی تلگرام ممکنه با شکل خام لینک ذخیره شده باشن.
-    const existing = await repo.findOne({
-      where: { identifier: In([parsed.identifier, input.link.trim()]) },
-    });
-
-    // قبلاً (احتمالاً توسط کاربر دیگه‌ای) ثبت شده -- دوباره عضو نمی‌شیم، فقط
-    // این کاربر هم به ثبت‌کننده‌ها اضافه می‌شه.
-    if (existing) {
-      const alreadyOwner = existing.ownerUserIds.includes(userId);
-      if (!alreadyOwner) {
-        existing.ownerUserIds = [...existing.ownerUserIds, userId];
-        await repo.save(existing);
-      }
-      // رکورد غیرفعال (لینک منقضی، حذف ربات از گروه، غیرفعال‌سازی دستی) پیامی
-      // نمی‌خونه -- کاربر باید بدونه چرا چیزی دریافت نمی‌کنه.
-      const inactiveWarning = existing.isActive
-        ? undefined
-        : `این گروه/کانال غیرفعاله و پیامی ازش خونده نمی‌شه${existing.lastError ? `: ${existing.lastError}` : '.'}`;
-      return {
-        status: alreadyOwner ? 'already_registered' : 'owner_added',
-        // سازگاری با مصرف‌کننده‌های فعلی (بات transport_backend و transport_front) که created می‌خونن.
-        created: false,
-        channel: this.toView(parsed.platform, existing),
-        warning: inactiveWarning ?? warning,
-      };
-    }
+    const identifiers = [parsed.identifier, input.link.trim()];
+    const existing = await repo.findOne({ where: { identifier: In(identifiers) } });
+    if (existing) return this.registerExisting(parsed.platform, existing, userId, warning);
 
     const common = {
       identifier: parsed.identifier,
@@ -199,11 +178,57 @@ export class ChannelRegistryService {
       ownerUserIds: [userId],
       isActive: true,
     };
-    const channel = await repo.save(
-      repo.create(parsed.platform === 'whatsapp' ? { ...common, type: parsed.type!, isFollowed: false } : common),
-    );
+    let channel: ChannelEntity;
+    try {
+      channel = await repo.save(
+        repo.create(parsed.platform === 'whatsapp' ? { ...common, type: parsed.type!, isFollowed: false } : common),
+      );
+    } catch (error) {
+      // کاربر دیگه‌ای هم‌زمان همین لینک رو ثبت کرد و insert اون زودتر انجام شد --
+      // به‌جای خطای ۵۰۰، این کاربر هم به ثبت‌کننده‌های همون رکورد اضافه می‌شه.
+      if (!isUniqueViolation(error)) throw error;
+      const winner = await repo.findOne({ where: { identifier: In(identifiers) } });
+      if (!winner) throw error;
+      return this.registerExisting(parsed.platform, winner, userId, warning);
+    }
 
     return { status: 'created', created: true, channel: this.toView(parsed.platform, channel), warning };
+  }
+
+  /**
+   * لینک قبلاً (احتمالاً توسط کاربر دیگه‌ای) ثبت شده -- دوباره عضو نمی‌شیم، فقط
+   * این کاربر هم به ثبت‌کننده‌ها اضافه می‌شه.
+   */
+  private async registerExisting(
+    platform: ChannelPlatform,
+    existing: ChannelEntity,
+    userId: string,
+    warning: string | undefined,
+  ): Promise<{ status: RegisterStatus; created: boolean; channel: ChannelView; warning?: string }> {
+    // این لینک قبلاً با رکورد دیگه‌ای ادغام شده (همون گروه/کانال با لینک دیگه) --
+    // کاربر مستقیم به رکورد اصلی اضافه می‌شه، وگرنه ثبت‌کننده‌ی یک رکورد
+    // غیرفعال می‌شد و باری دریافت نمی‌کرد. رکورد اصلی حذف شده باشه، همین رکورد می‌مونه.
+    const mergedIntoId = 'mergedIntoId' in existing ? existing.mergedIntoId : null;
+    if (mergedIntoId) {
+      const main = await this.channelRepos[platform].findOne({ where: { id: mergedIntoId } });
+      if (main) existing = main;
+    }
+
+    const added = await addChannelOwner(this.channelRepos[platform], existing.id, userId);
+    if (added) existing.ownerUserIds = [...existing.ownerUserIds.filter((id) => id !== userId), userId];
+
+    // رکورد غیرفعال (لینک منقضی، حذف ربات از گروه، غیرفعال‌سازی دستی) پیامی
+    // نمی‌خونه -- کاربر باید بدونه چرا چیزی دریافت نمی‌کنه.
+    const inactiveWarning = existing.isActive
+      ? undefined
+      : `این گروه/کانال غیرفعاله و پیامی ازش خونده نمی‌شه${existing.lastError ? `: ${existing.lastError}` : '.'}`;
+    return {
+      status: added ? 'owner_added' : 'already_registered',
+      // سازگاری با مصرف‌کننده‌های فعلی (بات transport_backend و transport_front) که created می‌خونن.
+      created: false,
+      channel: this.toView(platform, existing),
+      warning: inactiveWarning ?? warning,
+    };
   }
 
   async list(filter: ChannelFilter): Promise<ChannelView[]> {
@@ -226,15 +251,8 @@ export class ChannelRegistryService {
   /** فقط همین کاربر از ثبت‌کننده‌ها حذف می‌شه؛ بقیه همچنان اعلان می‌گیرن. */
   async removeOwner(platform: ChannelPlatform, id: string, userId: string): Promise<void> {
     const owner = this.requireUserId(userId);
-    const channel = await this.findOrFail(platform, id);
-    channel.ownerUserIds = channel.ownerUserIds.filter((existing) => existing !== owner);
-    await this.channelRepos[platform].save(channel);
-  }
-
-  /** حذف کامل رکورد (برای همه‌ی ثبت‌کننده‌ها). */
-  async delete(platform: ChannelPlatform, id: string): Promise<void> {
     await this.findOrFail(platform, id);
-    await this.channelRepos[platform].delete(id);
+    await removeChannelOwner(this.channelRepos[platform], id, owner);
   }
 
   async setActive(platform: ChannelPlatform, id: string, isActive: boolean): Promise<void> {

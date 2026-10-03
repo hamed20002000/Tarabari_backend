@@ -1,0 +1,31 @@
+diff --git a/node_modules/@hoseinbnoob/balejs/dist/core/grpc.js b/node_modules/@hoseinbnoob/balejs/dist/core/grpc.js
+index 0461012..b2f5ad1 100644
+--- a/node_modules/@hoseinbnoob/balejs/dist/core/grpc.js
++++ b/node_modules/@hoseinbnoob/balejs/dist/core/grpc.js
+@@ -127,7 +127,11 @@ class BaleGrpcConnection {
+         if (!this.client || this.client.closed || this.client.destroyed) {
+             this.client = node_http2_1.default.connect(this.baseUrl);
+             this.client.on("connect", () => {
+-                this.client?.socket?.setNoDelay(true);
++                // Node 20: socket in http2 is a Proxy and calling setNoDelay throws ERR_HTTP2_NO_SOCKET_MANIPULATION.
++                try {
++                    this.client?.socket?.setNoDelay(true);
++                }
++                catch { }
+             });
+             this.client.on("error", () => {
+                 this.client = undefined;
+diff --git a/node_modules/@hoseinbnoob/balejs/dist/proto/struct.proto b/node_modules/@hoseinbnoob/balejs/dist/proto/struct.proto
+index 615d1fa..0646f82 100644
+--- a/node_modules/@hoseinbnoob/balejs/dist/proto/struct.proto
++++ b/node_modules/@hoseinbnoob/balejs/dist/proto/struct.proto
+@@ -296,7 +296,8 @@ message MessageContainer {
+ message Group {
+   int32 id = 1;
+   string title = 3;
+-  int32 members_count = 20;
++  // Bale sends this as Int32Value; declaring it int32 corrupted id (wire type mismatch).
++  Int32Value members_count = 20;
+   repeated string available_reactions = 33;
+ }
+ 

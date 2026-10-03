@@ -4,6 +4,7 @@ import {
   DeepPartial,
   EntityTarget,
   FindOptionsOrder,
+  FindOptionsSelect,
   FindOptionsWhere,
   In,
   IsNull,
@@ -23,6 +24,7 @@ import { RecentIdCache } from '../common/recentIdCache';
 import { exponentialBackoffMinutes } from '../common/backoff';
 import { AccountPlatform, isChannelMonitoringEnabled } from '../common/channelMonitoring';
 import { randomBetween, sleep } from '../common/delay';
+import { addChannelOwner, HAS_OWNERS } from '../common/channelOwners';
 
 export interface JoinResult {
   chatId: string | null;
@@ -130,33 +132,21 @@ export abstract class AccountChannelMonitor<
     this.policy = joinPolicyFor(platform, policy);
   }
 
-  // ------------------------------------------------------------------
-  // بخش‌های مخصوص هر پلتفرم
-  // ------------------------------------------------------------------
+   //#region -------------------- بخش هایی که هر سرویس بابید خودش پیاده سازی کنه --------------
 
-  /** با نشست ذخیره‌شده وصل می‌شه و شنونده‌ی پیام‌ها رو (با enqueueMessage) ثبت می‌کنه. */
-  protected abstract connect(session: string): Promise<void>;
+  protected abstract connect(session: string): Promise<void>;//با نشست ذخیره‌شده وصل می‌شه و شنونده‌ی پیام‌ها رو (با enqueueMessage) ثبت می‌کنه. 
 
-  protected abstract disconnect(): Promise<void>;
+  protected abstract disconnect(): Promise<void>;//بخش مربوط به اتصال رو می‌بنده و شنونده‌ی پیام‌ها رو لغو می‌کنه.
 
-  /** تا وقتی false باشه، cron عضویت کاری نمی‌کنه. */
-  protected abstract get isConnected(): boolean;
+  protected abstract get isConnected(): boolean;//تا وقتی false باشه، cron عضویت کاری نمی‌کنه.
 
-  /** عضویت با لینک (یا ارسال درخواست عضویت اگه تایید ادمین لازم باشه). */
-  protected abstract join(identifier: string): Promise<JoinResult>;
+  protected abstract join(identifier: string): Promise<JoinResult>;//عضویت با لینک (یا ارسال درخواست عضویت اگه تایید ادمین لازم باشه). 
 
-  /** خطای عضویت رو به تصمیم مشترک ترجمه می‌کنه (PermanentJoinError از قبل پوشش داده شده). */
-  protected abstract classifyJoinError(error: unknown): JoinErrorDecision;
+  protected abstract classifyJoinError(error: unknown): JoinErrorDecision;//خطای عضویت رو به تصمیم مشترک ترجمه می‌کنه (PermanentJoinError از قبل پوشش داده شده).
 
-  /**
-   * اگه اکانت عضو شده باشه نتیجه‌ی عضویت رو برمی‌گردونه، وگرنه null. فقط برای
-   * پلتفرم‌هایی لازمه که درخواست عضویت (pending) دارن.
-   */
-  protected checkMembership?(identifier: string): Promise<JoinResult | null>;
+  protected checkMembership?(identifier: string): Promise<JoinResult | null>;//بررسی وضعیت عضویت بدون ارسال درخواست جدید (برای پلتفرم‌هایی که درخواست عضویت دارن).
 
-  // ------------------------------------------------------------------
-  // اتصال
-  // ------------------------------------------------------------------
+//#endregion ------------------------------------------------------------------------------------
 
   onModuleInit() {
     // اتصال نباید بالا اومدن کل برنامه رو معطل کنه.
@@ -168,33 +158,40 @@ export abstract class AccountChannelMonitor<
   }
 
   private async start(): Promise<void> {
-    // بدون اتصال، نه عضویتی انجام می‌شه و نه پیامی دریافت می‌شه.
+
+    //#region -------------------- بررسی اینکه آیا سرویس فعال است یا نه --------------
     if (!isChannelMonitoringEnabled(this.platform)) {
       this.logger.warn(`${this.platform} در CHANNEL_MONITORING_ENABLED نیست -- عضویت و گوش دادن به گروه/کانال‌هاش غیرفعاله.`);
       return;
     }
+    //#endregion -----------------------------------------------------------------------
 
-    const stored = await this.sessionRepo.findOne({ where: { sessionId: this.platform } });
-    if (!stored) {
-      this.logger.warn(`نشست ${this.platform} پیدا نشد -- یک بار \`npm run ${this.platform}:login\` رو اجرا کنید.`);
-      return;
-    }
-
+    // کل بدنه داخل try -- start با void صدا زده می‌شه و خطای بیرون از try
+    // (مثلاً قطعی لحظه‌ای دیتابیس) unhandled rejection می‌شد و پروسه رو می‌بست.
     try {
+
+      //#region -------------------- بررسی اینکه آیا قبل به اکانت لاگین شدیم یا نه--------
+      const stored = await this.sessionRepo.findOne({ where: { sessionId: this.platform } });
+      if (!stored) {
+        this.logger.warn(`نشست ${this.platform} پیدا نشد -- یک بار \`npm run ${this.platform}:login\` رو اجرا کنید.`);
+        return;
+      }
+      //#endregion -----------------------------------------------------------------------
+
+      //#region -------------------- اتصال به اکانت با نشست ذخیره‌شده --------------
       await this.connect(stored.session);
+      //#endregion ----------------------------------------------------------------
     } catch (error) {
       this.logger.error(`اتصال به ${this.platform} ناموفق بود`, error as Error);
     }
   }
 
-  /** اگه نشست بعد از اتصال عوض شده باشه (مثلاً تمدید توکن)، نسخه‌ی جدید ذخیره می‌شه. */
+  //#region ------------------------ اگه نشست بعد از اتصال عوض شده باشه (مثلاً تمدید توکن)، نسخه‌ی جدید ذخیره می‌شه. ------
   protected async updateSession(session: string): Promise<void> {
     await this.sessionRepo.update({ sessionId: this.platform }, { session });
   }
+  //#endregion -----------------------------------------------------------------------------------------------------------
 
-  // ------------------------------------------------------------------
-  // دریافت پیام‌ها
-  // ------------------------------------------------------------------
 
   //#region -------------------- صف بندی کردن عملیات برای کروه ها و کانال ها --------------
   protected enqueueMessage(message: IncomingChatMessage): void {
@@ -204,18 +201,24 @@ export abstract class AccountChannelMonitor<
   }
   //#endregion -----------------------------------------------------------------------------
 
-  /**
-   * پردازش یک پیام جدید از گروه یا کانال: تشخیص سفارش بار، و فقط برای سفارش
-   * بار -- ذخیره در دیتابیس و انتشار event (cargo.message.detected) از طریق
-   * Outbox Pattern برای توزیع‌کننده.
-   */
+ 
+
+  //#region -------------------- پردازش یک پیام جدید از گروه یا کانال: تشخیص سفارش بار، و فقط برای سفارش
+  //بار -- ذخیره در دیتابیس و انتشار event (cargo.message.detected) از طریق 
+  // Outbox Pattern برای توزیع‌کننده. --------------
   private async handleChatMessage({ chatId, messageId, text, voice }: IncomingChatMessage): Promise<void> {
     
+    //#region --------------------  جلوگیری از ارسال پیام های تکراری --------------
     const key = `${chatId}:${messageId}`;
     const label = `${this.platform} ${key}`;
+
     if (this.recentMessageKeys.has(key)) return;
+    //#endregion ------------------------------------------------------------------------------
+   
 
     // فقط از گروه/کانال‌هایی که به‌عنوان منبع ثبت و فعال شدن پیام می‌خونیم.
+
+    //#region --------------------   فقط از گروه/کانال‌هایی که به‌عنوان منبع ثبت و فعال شدن پیام می‌خونیم و مخصوص همون سرویس یعنی تلگرام بله روبیکا --------------
     const channel = await this.channelRepo.findOne({
       where: {
         chatId,
@@ -224,8 +227,12 @@ export abstract class AccountChannelMonitor<
       } as FindOptionsWhere<C>,
     });
     if (!channel) return;
+    //#endregion ------------------------------------------------------------------------------
+
 
     // رسیدن پیام یعنی عضو هستیم -- مثلاً درخواست عضویت تازه تایید شده.
+
+    //#region --------------------   بررسی عضویت در گروه/کانال چون وقتی پیغام میاد یعنی عضو شدیم برای کانال و گروه هایی هنوز تاپید عضویت نشدیم --------------
     if (!channel.isMember) {
       channel.isMember = true;
       channel.joinRequestPending = false;
@@ -234,18 +241,28 @@ export abstract class AccountChannelMonitor<
       channel.nextAttemptAt = null;
       await this.membership.transition(this.platform, channel, ChannelMembershipStatus.JOINED);
     }
+    //#endregion ------------------------------------------------------------------------------
 
+    // همه‌ی ثبت‌کننده‌ها حذفش کردن -- بار برای کسی نیست، فرستادن به مدل هزینه‌ی بی‌فایده‌ست.
+    if (channel.ownerUserIds.length === 0) return;
+
+    //#region --------------------   بررسی اینکه آیا پیام تکراری هست یا نه --------------
     const existing = await this.messageRepo.findOne({ where: { chatId, messageId } as FindOptionsWhere<M> });
     if (existing) return;
+    //#endregion ------------------------------------------------------------------------------
 
-    this.recentMessageKeys.add(key);
 
-    // پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه.
+    this.recentMessageKeys.add(key);//ذخیره کلید پیام در recentMessageKeys تا جلوی پردازش دوباره‌ی پیام‌های غیربارِ تکراری گرفته بشه.
+
+    //#region --------------------   پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه --------------
     if (voice) {
       text = await this.speechToText.transcribeVoice(voice.durationSeconds, voice.download, label);
       if (!text) return;
     }
+    //#endregion ------------------------------------------------------------------------------
 
+
+    //#region --------------------   پردازش پیام: تشخیص بار و انتشار event (cargo.message.detected) --------------
     await this.cargoPipeline.process({
       label,
       text,
@@ -255,12 +272,12 @@ export abstract class AccountChannelMonitor<
       source: { platform: this.platform, chatId },
       ownerUserIds: channel.ownerUserIds,
     });
+    //#endregion ------------------------------------------------------------------------------
   }
+  //#endregion ------------------------------------------------------------------------------
 
-  // ------------------------------------------------------------------
-  // عضویت در گروه/کانال‌های ثبت‌شده در دیتابیس
-  // ------------------------------------------------------------------
 
+  //#region --------------------  cron برای بررسی گروه/کانال‌های ثبت‌شده و عضویت با لینک‌ها --------------
   @Cron('*/2 * * * *')
   async syncMonitoredChannels(): Promise<void> {
     if (!this.isConnected || this.isSyncing) return;
@@ -274,23 +291,38 @@ export abstract class AccountChannelMonitor<
       this.isSyncing = false;
     }
   }
+  //#endregion ------------------------------------------------------------------------------
 
-  /** در هر اجرا حداکثر یک عضویت -- با فاصله‌ی تصادفی و سقف روزانه. */
+  //#region --------------------  در هر اجرا حداکثر یک عضویت -- با فاصله‌ی تصادفی و سقف روزانه. --------
   private async joinNextChannel(): Promise<void> {
-    if (Date.now() < this.nextJoinAllowedAt) return;
 
+    //#region --------------------   بررسی زمان اجازه‌ی عضویت بعدی جهت جلوگیری از مسدود شدن--------------
+     if (Date.now() < this.nextJoinAllowedAt) return;
+    //#endregion ------------------------------------------------------------------------------
+
+    //#region --------------------  بررسی تعداد تلاش‌های عضویت در ۲۴ ساعت گذشته جهت جلوگیری از مسدود شدن--------------
     const attemptsLast24h = await this.channelRepo.count({
       where: { lastJoinAttemptAt: MoreThanOrEqual(new Date(Date.now() - 24 * 60 * 60 * 1000)) } as FindOptionsWhere<C>,
     });
     if (attemptsLast24h >= this.policy.dailyJoinLimit) return;
 
+    //#endregion ------------------------------------------------------------------------------
+
     const now = new Date();
+
+    //#region -------------------- شرایط لازم برای تشخیص گروه/کانال‌های قابل عضویت --------------
     const pendingFilter = {
       isActive: true,
       isMember: false,
       joinRequestPending: false,
       identifier: Not(IsNull()),
+      // رکوردی که همه‌ی ثبت‌کننده‌هاش حذفش کردن -- عضویت بی‌دلیل (ریسک بن، مصرف سقف روزانه).
+      // با ثبت دوباره‌ی لینک، ثبت‌کننده اضافه می‌شه و خودبه‌خود دوباره در صف قرار می‌گیره.
+      ownerUserIds: HAS_OWNERS,
     };
+    //#endregion ------------------------------------------------------------------------------
+
+    //#region --------------------  پیدا کردن گروه/کانال‌های قابل عضویت و تلاش برای عضویت --------------
     const channel = await this.channelRepo.findOne({
       where: [
         { ...pendingFilter, nextAttemptAt: IsNull() },
@@ -299,26 +331,33 @@ export abstract class AccountChannelMonitor<
       order: { createdAt: 'ASC' } as FindOptionsOrder<C>,
     });
     if (!channel) return;
+    //#endregion ------------------------------------------------------------------------------
+
+
+    //#region --------------------  ثبت زمان آخرین تلاش عضویت و زمان اجازه‌ی عضویت بعدی جهت جلوگیری از مسدود شدن --------------
 
     channel.lastJoinAttemptAt = now;
     this.nextJoinAllowedAt =
       Date.now() + (this.policy.joinMinIntervalMinutes + Math.random() * this.policy.joinJitterMinutes) * 60_000;
-
+    //#endregion ------------------------------------------------------------------------------
+   
     try {
-      const result = await this.join(channel.identifier!);
+      const result = await this.join(channel.identifier!);//عضویت با لینک (یا ارسال درخواست عضویت اگه تایید ادمین لازم باشه).
       await this.applyJoinResult(channel, result);
     } catch (error) {
       await this.handleJoinError(channel, error);
     }
   }
+  //#endregion ----------------------------------------------------------------------------------------
 
-  /** درخواست‌های عضویتِ منتظر تایید رو بررسی می‌کنه (بدون فرستادن درخواست جدید). */
+  //#region --------------- درخواست‌های عضویتِ منتظر تایید رو بررسی می‌کنه (بدون فرستادن درخواست جدید).  ----------
   private async recheckPendingRequests(): Promise<void> {
     const pending = await this.channelRepo.find({
       where: {
         isActive: true,
         joinRequestPending: true,
         nextAttemptAt: LessThanOrEqual(new Date()),
+        ownerUserIds: HAS_OWNERS,
       } as FindOptionsWhere<C>,
       take: 5,
     });
@@ -355,30 +394,69 @@ export abstract class AccountChannelMonitor<
       await sleep(randomBetween(3_000, 8_000));
     }
   }
+  //#endregion --------------------------------------------------------------------------------------
 
+  /**
+   * channel قبل از درخواست به پیام‌رسان (که چند ثانیه طول می‌کشه) خونده شده و
+   * save همه‌ی ستون‌های متفاوت رو می‌نویسه -- با ownerUserIds قدیمی، شرکتی که
+   * این وسط همین لینک رو ثبت کرده بود پاک می‌شد. (رکورد از برنامه حذف نمی‌شه،
+   * فقط ثبت‌کننده‌هاش کم و زیاد می‌شن.)
+   */
+  private async refreshOwners(channel: C): Promise<void> {
+    const current = await this.channelRepo.findOne({
+      where: { id: channel.id } as FindOptionsWhere<C>,
+      select: { id: true, ownerUserIds: true } as FindOptionsSelect<C>,
+    });
+    if (current) channel.ownerUserIds = current.ownerUserIds;
+  }
+
+  //#region ------------------------- آماده سازی نتیجه جوین شدن و اطلاع به کاربر ----------------
   private async applyJoinResult(channel: C, result: JoinResult): Promise<void> {
-    if (result.chatId && result.chatId !== channel.chatId) {
-      const duplicate = await this.channelRepo.findOne({ where: { chatId: result.chatId } as FindOptionsWhere<C> });
-      if (duplicate && duplicate.id !== channel.id) {
+    await this.refreshOwners(channel);
+
+    if (result.chatId) {
+      // رکورد دیگه‌ای (غیر از همین) با همین شناسه؟ -- یعنی همون گروه/کانال با لینک دیگه‌ای ثبت شده.
+      const duplicate = await this.channelRepo.findOne({
+        where: { chatId: result.chatId, id: Not(channel.id) } as FindOptionsWhere<C>,
+      });
+      if (duplicate) {
         // همون گروه/کانال با لینک دیگه‌ای ثبت شده -- ثبت‌کننده‌های این رکورد
         // به رکورد اصلی منتقل می‌شن تا اعلان‌ها براشون قطع نشه.
-        const missingOwners = channel.ownerUserIds.filter((id) => !duplicate.ownerUserIds.includes(id));
-        if (missingOwners.length > 0) {
-          duplicate.ownerUserIds = [...duplicate.ownerUserIds, ...missingOwners];
-          await this.channelRepo.save(duplicate);
+        const thisLinkOwners = channel.ownerUserIds;
+        // اضافه کردن اتمیک -- ثبت هم‌زمان از API روی رکورد اصلی رو بازنویسی نمی‌کنه.
+        const movedOwners: string[] = [];
+        for (const userId of thisLinkOwners) {
+          if (await addChannelOwner(this.channelRepo, duplicate.id, userId)) movedOwners.push(userId);
+        }
+        if (movedOwners.length > 0) {
+          duplicate.ownerUserIds = [...duplicate.ownerUserIds, ...movedOwners];
           // وضعیت رکورد اصلی (مثلاً «عضو شد») به کاربرهای منتقل‌شده اعلام می‌شه.
-          await this.membership.announce(this.platform, duplicate, missingOwners);
+          await this.membership.announce(this.platform, duplicate, movedOwners);
         }
         // ثبت‌کننده‌ها منتقل شدن -- این رکورد دیگه در لیست هیچ کاربری نمیاد.
+        // ولی باید به ثبت‌کننده‌هاش اعلام بشه، وگرنه پنل‌شون همچنان «در صف» نشونش می‌ده
+        // (مخصوصاً وقتی خودشون رکورد اصلی رو هم ثبت کرده بودن و announce بالا چیزی نفرستاده).
         channel.ownerUserIds = [];
+        // ثبت بعدیِ همین لینک از API مستقیم به رکورد اصلی اضافه می‌شه (registerExisting).
+        channel.mergedIntoId = duplicate.id;
         channel.isActive = false;
         channel.joinRequestPending = false;
         channel.nextAttemptAt = null;
-        channel.lastError = `این گروه/کانال قبلاً با رکورد دیگه‌ای ثبت شده (${duplicate.identifier ?? duplicate.id}).`;
-        await this.channelRepo.save(channel);
+        // اسم/لینک رکورد اصلی عمداً نمیاد -- ممکنه مال شرکت دیگه‌ای باشه (برچسب خودش یا لینک دعوت خصوصی).
+        channel.lastError =
+          'این لینک مال گروه/کانالیه که قبلاً با لینک دیگه‌ای ثبت شده؛ بارهاش از همون ثبت قبلی برای شما هم ارسال می‌شه.';
+        await this.membership.transition(
+          this.platform,
+          channel,
+          ChannelMembershipStatus.FAILED,
+          channel.lastError,
+          thisLinkOwners,
+        );
         return;
       }
       channel.chatId = result.chatId;
+      // رکوردی که قبلاً ادغام شده بود و دوباره فعال و عضو شد (مثلاً رکورد اصلی حذف شده) -- دیگه ادغام‌شده نیست.
+      channel.mergedIntoId = null;
     }
 
     channel.label = channel.label ?? result.title;
@@ -401,11 +479,9 @@ export abstract class AccountChannelMonitor<
       await this.membership.transition(this.platform, channel, ChannelMembershipStatus.JOINED);
     }
   }
-
-  /**
-   * اکانت از گروه/کانال حذف (kick/ban) شد -- مثل واتساپ رکورد غیرفعال و به
-   * ثبت‌کننده‌ها اعلام می‌شه؛ با فعال‌سازی دوباره از پنل، از اول عضو می‌شه.
-   */
+  //#endregion ----------------------------------------------------------------------------------
+  
+  //#region ---------------     اکانت از گروه/کانال حذف (kick/ban) شد -- مثل واتساپ رکورد غیرفعال و به ثبت‌کننده‌ها اعلام می‌شه؛ با فعال‌سازی دوباره از پنل، از اول عضو می‌شه. --
   protected async markRemoved(chatId: string, reason: string): Promise<void> {
     const channels = await this.channelRepo.find({ where: { chatId, isMember: true } as FindOptionsWhere<C> });
     for (const channel of channels) {
@@ -418,8 +494,10 @@ export abstract class AccountChannelMonitor<
       this.logger.warn(`🚫 اکانت ${this.platform} از گروه/کانال حذف شد: ${chatId} (${channel.label ?? channel.identifier})`);
     }
   }
+  //#endregion -------------------------------------------------------------------------------------------------------------------------------------------------------------
 
-  /** عضویت ممکن نیست -- رکورد غیرفعال می‌شه و به ثبت‌کننده‌ها اعلام می‌شه. */
+  
+  //#region ------------------- عضویت ممکن نیست -- رکورد غیرفعال می‌شه و به ثبت‌کننده‌ها اعلام می‌شه. -------------
   private async markFailed(channel: C, reason: string): Promise<void> {
     channel.isActive = false;
     channel.joinRequestPending = false;
@@ -428,8 +506,12 @@ export abstract class AccountChannelMonitor<
     await this.membership.transition(this.platform, channel, ChannelMembershipStatus.FAILED, reason);
     this.logger.error(`عضویت ممکن نیست (${channel.identifier}): ${reason}`);
   }
+  //#endregion ------------------------------------------------------------------------------------------------
 
+  //#region ------------------- خطاهای جوین شدن رو در دیتابیس اعلام و به کاربر اعلام میکنه --------
   private async handleJoinError(channel: C, error: unknown): Promise<void> {
+    await this.refreshOwners(channel);
+
     const decision: JoinErrorDecision =
       error instanceof PermanentJoinError
         ? { kind: 'permanent', reason: error.message }
@@ -473,4 +555,5 @@ export abstract class AccountChannelMonitor<
       error as Error,
     );
   }
+  //#endregion -----------------------------------------------------------------------------------
 }

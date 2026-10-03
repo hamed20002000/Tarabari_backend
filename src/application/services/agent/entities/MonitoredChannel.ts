@@ -35,9 +35,9 @@ export class MonitoredChannel {
   @Column({ nullable: true })
   resolvedJid: string | null;
 
-  // کاربرهایی که این گروه/کانال رو ثبت کردن. پیام‌ها همیشه پردازش می‌شن،
-  // ولی اعلان و نمایش پیام‌های بارِ این گروه/کانال فقط برای همین کاربرهاست
-  // (ownerUserIds در payload رویداد). ایندکس GIN در مایگریشن ساخته شده.
+  // کاربرهایی که این گروه/کانال رو ثبت کردن -- اعلان و نمایش بارها فقط برای
+  // همین‌هاست (ownerUserIds در payload رویداد). بدون ثبت‌کننده، نه عضو می‌شیم و
+  // نه پیامش پردازش می‌شه (HAS_OWNERS). ایندکس GIN در مایگریشن ساخته شده.
   @Column('text', { array: true, default: () => "'{}'" })
   ownerUserIds: string[];
 

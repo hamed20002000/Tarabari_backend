@@ -83,8 +83,11 @@ export class ChannelsController {
   }
 
   /**
-   * با userId فقط همون کاربر از ثبت‌کننده‌ها حذف می‌شه (بقیه همچنان اعلان
-   * می‌گیرن)؛ بدون userId کل رکورد حذف می‌شه.
+   * فقط همون کاربر از ثبت‌کننده‌ها حذف می‌شه (بقیه همچنان اعلان می‌گیرن).
+   * حذف کامل رکورد عمداً وجود نداره: رکورد بدون ثبت‌کننده بی‌اثره (نه عضو
+   * می‌شیم نه پیامش پردازش می‌شه) و نگه داشتنش chatId رو حفظ می‌کنه تا ثبت
+   * دوباره عضویت تازه (ریسک بن) لازم نداشته باشه. userId خالی (مثلاً باگ
+   * فرستنده) هم دیگه رکورد رو برای همه پاک نمی‌کنه.
    */
   @Delete(':platform/:id')
   async remove(
@@ -93,8 +96,8 @@ export class ChannelsController {
     @Query('userId') userId?: string,
   ) {
     const parsed = parsePlatform(platform, true);
-    if (userId) await this.registry.removeOwner(parsed, id, userId);
-    else await this.registry.delete(parsed, id);
+    if (!userId?.trim()) throw new BadRequestException('userId الزامیه -- حذف کامل گروه/کانال پشتیبانی نمی‌شه.');
+    await this.registry.removeOwner(parsed, id, userId);
     return { success: true };
   }
 

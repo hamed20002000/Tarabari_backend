@@ -64,6 +64,7 @@ class RubikaAccountClient extends RubikaClient {
   // جایگزین لاگین تعاملی rubjs -- لاگین با authenticate و بدون stdin انجام می‌شه.
   async start(): Promise<void> { }
 
+  //#region ------------------- لاگین با نشست ذخیره‌شده (بدون stdin) -------------------
   async authenticate(): Promise<void> {
     const session = this.sessionDb.getSession() as { auth?: string; guid?: string; private_key?: string; agent?: string } | null;
     if (!session?.auth) throw new RubikaApiError('INVALID_AUTH', 'start');
@@ -79,8 +80,12 @@ class RubikaAccountClient extends RubikaClient {
     this.userGuid = me.user.user_guid;
     this.initialize = true;
   }
+    //#endregion ----------------------------------------------------------------------
+
 
   /** مثل builder خود rubjs، ولی با خطای دارای کد به‌جای undefined. */
+  
+  //#region ---------------- یک wrapper عمومی برای API روبیکاست ------------------------
   async call<T = any>(method: string, input: Record<string, unknown>): Promise<T> {
     const response = await this.network.send({ method, input, tmp_session: false });
     if (!response) throw new RubikaApiError('NO_RESPONSE', method);
@@ -91,6 +96,7 @@ class RubikaAccountClient extends RubikaClient {
     if (result.status === 'OK' && result.status_det === 'OK') return result.data as T;
     throw new RubikaApiError(String(result.status_det ?? result.status ?? 'UNKNOWN'), method);
   }
+  //#endregion --------------------------------------------------------------------------
 }
 
 /**
@@ -101,10 +107,14 @@ class RubikaAccountClient extends RubikaClient {
  */
 @Injectable()
 export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredChannel, RubikaChannelMessage> {
+  
+  
+  //#region --------------------- تعریف متغییرهای خصوصی -----------------------
   private client: RubikaAccountClient | null = null;
   private stopped = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
+  //#endregion -----------------------------------------------------------------
 
   constructor(
     @InjectRepository(RubikaMonitoredChannel)
@@ -123,10 +133,14 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     });
   }
 
+  //#region ------------------------ آیا  اکانت روبیکا وصل هست ---------------------------
   protected get isConnected(): boolean {
     return !!this.client;
   }
+  //#endregion ----------------------------------------------------------------------------
 
+
+  //#region ------------------------ قطع اتصال از روبیکا ---------------------------
   protected async disconnect(): Promise<void> {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
@@ -141,7 +155,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     clearTimeout(network.inactivityTimeout);
     network.ws?.close();
   }
+  //#endregion ----------------------------------------------------------------------
 
+  //#region ------------------------ اتصال به روبیکا با نشست ذخیره‌شده ---------------------------
   protected async connect(session: string): Promise<void> {
     // نشست همون خروجی رمزشده‌ی rubjs ({ iv, enData }) هست که اسکریپت لاگین ذخیره کرده.
     const client = new RubikaAccountClient(JSON.parse(session));
@@ -165,8 +181,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     this.reconnectAttempts = 0;
     this.logger.log(`اکانت روبیکا متصل شد: ${client.userGuid}`);
   }
+  //#endregion ---------------------------------------------------------------------------------
 
-  /** اتصال اولیه ناموفق (شبکه، سرور روبیکا) -- با فاصله‌ی ۱، ۲، ۴ ... تا ۳۰ دقیقه دوباره تلاش می‌شه. */
+  //#region ------------------------- اتصال اولیه ناموفق (شبکه، سرور روبیکا) -- با فاصله‌ی ۱، ۲، ۴ ... تا ۳۰ دقیقه دوباره تلاش می‌شه -----
   private scheduleReconnect(session: string, error: unknown): void {
     if (this.stopped) return;
     const delayMs = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_DELAY_MS);
@@ -179,7 +196,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
       void this.connect(session).catch((err) => this.scheduleReconnect(session, err));
     }, delayMs);
   }
+  //#endregion -------------------------------------------------------------------------------------------------------------------------
 
+  //#region -------------------------- پردازش پیغام دریافتی ---------------------------------
   private onMessage(client: RubikaAccountClient, ctx: RubikaMessage): void {
     // g0 = گروه، c0 = کانال -- پیوی (u0) و ربات‌ها (b0) نادیده گرفته می‌شن.
     const chatId = ctx.object_guid;
@@ -231,7 +250,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
         : undefined,
     });
   }
+  //#endregion -------------------------------------------------------------------------------
 
+  //#region -------------------------- مشخص کردن نوع خطا هنگام عضویت --------------------------
   protected classifyJoinError(error: unknown): JoinErrorDecision {
     const status = error instanceof RubikaApiError ? error.status : '';
     const message = (error as Error)?.message ?? '';
@@ -251,11 +272,10 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     }
     return { kind: 'retry' };
   }
+  //#endregion ---------------------------------------------------------------------------------
 
-  // ------------------------------------------------------------------
-  // فراخوانی‌های روبیکا
-  // ------------------------------------------------------------------
-
+  
+  //#region ---------------------------- تابع جوین ---------------------------------------------
   protected async join(identifier: string): Promise<JoinResult> {
     const client = this.client!;
     const parsed = RubikaChannelService.parseIdentifier(identifier);
@@ -281,7 +301,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     this.logger.warn(`جواب عضویت روبیکا بدون شناسه‌ی گروه/کانال بود: ${JSON.stringify(result)?.slice(0, 500)}`);
     return { ...preview, pending: true };
   }
+  //#endregion ----------------------------------------------------------------------------------
 
+  //#region ---------------------------- بررسی اینکه اکلنت روبیکا عضو کانال یا گروه هست یا نه-----
   protected async checkMembership(identifier: string): Promise<JoinResult | null> {
     const client = this.client!;
     const preview = await this.preview(RubikaChannelService.parseIdentifier(identifier));
@@ -298,8 +320,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     // گفتگو (chat) فقط وقتی برمی‌گرده که گروه/کانال در لیست گفتگوهای اکانت باشه، یعنی عضویم.
     return info?.chat ? preview : null;
   }
+  //#endregion --------------------------------------------------------------------------------------
 
-  /** شناسه، اسم و نوع گروه/کانال رو بدون عضویت پیدا می‌کنه. */
+  //#region ------------------------ شناسه، اسم و نوع گروه/کانال رو بدون عضویت پیدا می‌کنه. ---------
   private async preview(parsed: ParsedIdentifier): Promise<JoinResult> {
     const client = this.client!;
 
@@ -329,7 +352,9 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
     }
     return this.channelResult(result.channel);
   }
+  //#endregion ---------------------------------------------------------------------------------
 
+  //#region ------------------------- همون applyJoinResult -------------------------------------
   private channelResult(channel: { channel_guid: string; channel_title?: string }): JoinResult {
     return {
       chatId: channel.channel_guid,
@@ -338,6 +363,7 @@ export class RubikaChannelService extends AccountChannelMonitor<RubikaMonitoredC
       pending: false,
     };
   }
+  //#endregion ---------------------------------------------------------------------------------
 
   /**
    * لینک خصوصی گروه: rubika.ir/joing/HASH، کانال: rubika.ir/joinc/HASH

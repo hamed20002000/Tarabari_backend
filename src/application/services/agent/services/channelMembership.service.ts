@@ -44,13 +44,15 @@ export class ChannelMembershipService {
 
   /**
    * بقیه‌ی فیلدهای channel (isMember، lastError و ...) باید قبل از صدا زدن
-   * تنظیم شده باشن -- همه با هم ذخیره می‌شن.
+   * تنظیم شده باشن -- همه با هم ذخیره می‌شن. recipients پیش‌فرض ثبت‌کننده‌های
+   * فعلی رکورده؛ وقتی ثبت‌کننده‌ها همزمان پاک می‌شن، لیست قبلی رو بدید.
    */
   async transition(
     platform: Platform,
     channel: ChannelRecord,
     status: ChannelMembershipStatus,
     reason: string | null = null,
+    recipients: string[] = channel.ownerUserIds,
   ): Promise<void> {
     const previousStatus = channel.membershipStatus ?? null;
     channel.membershipStatus = status;
@@ -59,7 +61,7 @@ export class ChannelMembershipService {
       // channel نمونه‌ی entity همون پلتفرمه -- جدولش از روی کلاسش معلوم می‌شه.
       await manager.save(channel);
       if (previousStatus !== status) {
-        await this.insertEvent(manager, platform, channel, previousStatus, reason, channel.ownerUserIds);
+        await this.insertEvent(manager, platform, channel, previousStatus, reason, recipients);
       }
     });
 
