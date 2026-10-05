@@ -26,6 +26,8 @@ export interface CargoCandidate<T extends CargoMessageRecord> {
 
 export interface CargoMessageRecord extends ObjectLiteral {
   id: string;
+  /** ترتیب بار داخل پیام (۰ برای اولین) -- یک پیام ممکنه چند بار داشته باشه. */
+  cargoIndex: number;
   code: string;
   receivedAt: Date;
 }
@@ -79,49 +81,58 @@ export class CargoPipelineService {
     { label, text, isVoice, entity, record, source, ownerUserIds }: CargoCandidate<T>,
     extraction: CargoOrderExtraction,
   ): Promise<void> {
-    // ذخیره‌ی رکورد پیام + ثبت رکورد outbox در یه تراکنش واحد -- یا هر دو
+    // ذخیره‌ی رکوردهای بار + ثبت رکوردهای outbox در یه تراکنش واحد -- یا همه
     // انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
     // توزیع‌کننده (برنامه‌ی دیگه) هست که این event رو مصرف می‌کنه.
-    const saved = await this.dataSource.transaction(async (manager) => {
-      const code = await this.nextCargoCode(manager);
-      const processedText = buildCargoProcessedText(extraction, code);
+    // هر بارِ پیام (یک مسیر مستقل) رکورد، کد پیگیری و event خودش رو داره --
+    // توزیع‌کننده هر event رو با messageId (شناسه‌ی همین رکورد) یک بار جدا حساب می‌کنه.
+    const codes = await this.dataSource.transaction(async (manager) => {
+      const saved: string[] = [];
 
-      const message = await manager.save(
-        entity,
-        manager.create(entity, {
-          ...record,
-          code,
-          rawText: text,
-          confidence: extraction.confidence,
-          foundPhoneNumbers: extraction.found_phone_numbers,
-        } as DeepPartial<T>),
-      );
+      for (const [cargoIndex, load] of extraction.loads.entries()) {
+        const code = await this.nextCargoCode(manager);
+        const processedText = buildCargoProcessedText(load, code);
 
-      await manager.insert(OutboxEvent, {
-        eventType: 'cargo.message.detected',
-        payload: {
-          ...source,
-          messageId: message.id,
-          code,
-          isVoice,
-          rawText: text,
-          receivedAt: message.receivedAt,
-          origin: extraction.origin,
-          destination: extraction.destination,
-          cargoType: extraction.cargo_type,
-          weight: extraction.weight,
-          vehicleType: extraction.vehicle_type,
-          price: extraction.price,
-          extraNotes: extraction.extra_notes,
-          processedText,
-          ownerUserIds,
-        },
-      });
+        const message = await manager.save(
+          entity,
+          manager.create(entity, {
+            ...record,
+            cargoIndex,
+            code,
+            rawText: text,
+            confidence: extraction.confidence,
+            foundPhoneNumbers: extraction.found_phone_numbers,
+          } as DeepPartial<T>),
+        );
 
-      return message;
+        await manager.insert(OutboxEvent, {
+          eventType: 'cargo.message.detected',
+          payload: {
+            ...source,
+            messageId: message.id,
+            code,
+            isVoice,
+            rawText: text,
+            receivedAt: message.receivedAt,
+            origin: load.origin,
+            destination: load.destination,
+            cargoType: load.cargo_type,
+            weight: load.weight,
+            vehicleType: load.vehicle_type,
+            price: load.price,
+            extraNotes: load.extra_notes,
+            processedText,
+            ownerUserIds,
+          },
+        });
+
+        saved.push(code);
+      }
+
+      return saved;
     });
 
-    this.logger.log(`✅ سفارش بار تشخیص داده شد [${label}] [${saved.code}]`);
+    this.logger.log(`✅ ${codes.length} بار تشخیص داده شد [${label}] [${codes.join(', ')}]`);
   }
 
   /** کد پیگیری بعدی: TRB + عدد sequence مشترک بین همه‌ی پلتفرم‌ها. */

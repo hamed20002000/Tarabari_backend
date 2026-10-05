@@ -3,7 +3,7 @@ import { AccountChannelMessageBase } from './AccountChannelBase';
 
 /** پیام‌های بارِ تشخیص‌داده‌شده از گروه/کانال‌های روبیکا. */
 @Entity()
-@Index('UQ_rubika_channel_message_chat_message', ['chatId', 'messageId'], { unique: true })
+@Index('UQ_rubika_channel_message_chat_message', ['chatId', 'messageId', 'cargoIndex'], { unique: true })
 export class RubikaChannelMessage extends AccountChannelMessageBase {
   @Index('IDX_rubika_channel_message_chatId')
   @Column({ type: 'varchar' })

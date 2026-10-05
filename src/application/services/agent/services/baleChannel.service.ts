@@ -5,6 +5,7 @@ import axios from 'axios';
 import {
   BaleRpcError,
   Chat as BaleChat,
+  ClientStateError,
   ChatType as BaleChatType,
   Client as BaleClient,
   Message as BaleMessage,
@@ -75,6 +76,11 @@ export class BaleChannelService extends AccountChannelMonitor<BaleMonitoredChann
       this.client = client;
       this.logger.log(`اکانت بله متصل شد: ${client.user?.username ? '@' + client.user.username : client.user?.id}`);
     });
+    // همان لحظه‌ی قطع socket دیگر متصل حساب نمی‌شود -- وگرنه cron با کلاینت مرده
+    // عضویت را امتحان می‌کرد و «Bale websocket is not connected» می‌گرفت.
+    client.on_disconnect(() => {
+      if (this.client === client) this.client = null;
+    });
 
     // run تا قطع اتصال (یا خطای اتصال) برنمی‌گرده -- بعدش دوباره وصل می‌شیم.
     // catch لازمه -- finally خطا رو دوباره پرتاب می‌کنه و unhandled rejection پروسه رو می‌بست.
@@ -142,6 +148,20 @@ export class BaleChannelService extends AccountChannelMonitor<BaleMonitoredChann
 
   protected async join(identifier: string): Promise<JoinResult> {
     const client = this.client!;
+    try {
+      return await this.joinWith(client, identifier);
+    } catch (error) {
+      // socket بسته است ولی run() تمام نشده (مثلاً قطع وسط اتصال که on_disconnect
+      // را صدا نمی‌زند) -- stop باعث می‌شود run تمام شود و finally دوباره وصل کند.
+      if (error instanceof ClientStateError && this.client === client) {
+        this.client = null;
+        void client.stop().catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  private async joinWith(client: BaleClient, identifier: string): Promise<JoinResult> {
     const parsed = BaleChannelService.parseIdentifier(identifier);
 
     if (parsed.kind === 'invite') {

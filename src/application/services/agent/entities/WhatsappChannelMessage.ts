@@ -7,6 +7,8 @@ import {
 } from 'typeorm';
 
 @Entity()
+// یک پیام ممکنه چند بار داشته باشه -- هر بار یک رکورد با cargoIndex خودش.
+@Index('UQ_whatsapp_channel_message_message_cargo', ['messageId', 'cargoIndex'], { unique: true })
 export class WhatsappChannelMessage {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -20,9 +22,12 @@ export class WhatsappChannelMessage {
   @Column()
   channelJid: string;
 
-  @Index({ unique: true })
   @Column()
   messageId: string;
+
+  /** ترتیب بار داخل پیام (۰ برای اولین). */
+  @Column({ type: 'integer', default: 0 })
+  cargoIndex: number;
 
   @Column('text')
   rawText: string;

@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { CargoSubscription } from '../entities/CargoSubscription';
-import { CargoOrderExtraction } from './aiTools.service';
+import { CargoLoad } from './aiTools.service';
 import { normalizePersianText } from '../utils/persianText';
 
 export interface SubscriberMatch {
@@ -22,7 +22,7 @@ export class CargoSubscriptionService {
    * هر subscriber فقط یک بار برگردونده می‌شه، حتی اگه چند ردیفش match بشه.
    */
   async findMatchingSubscribers(
-    extraction: CargoOrderExtraction,
+    extraction: CargoLoad,
   ): Promise<SubscriberMatch[]> {
     const subscriptions = await this.subscriptionRepo.find({
       where: { isActive: true },
@@ -44,7 +44,7 @@ export class CargoSubscriptionService {
 
   private isMatch(
     subscription: CargoSubscription,
-    extraction: CargoOrderExtraction,
+    extraction: CargoLoad,
   ): boolean {
     return (
       this.fieldMatches(subscription.origins, extraction.origin) &&

@@ -8,11 +8,10 @@ import { SerialTaskQueue } from '../common/serialTaskQueue';
 // ------------------------------------------------------------------
 // Schema خروجی خام مدل -- فقط فیلدهای استخراج‌شده، بدون متن نهایی.
 // مدل هرگز متن نمایشی نمی‌سازد؛ فقط داده‌ی ساختاریافته تولید می‌کند.
+// یک پیام ممکن است چند بار (چند مسیر مستقل) داشته باشد -- هر کدام یک
+// عضو loads است و جداگانه ذخیره و با کد پیگیری خودش منتشر می‌شود.
 // ------------------------------------------------------------------
-const CargoExtractionSchema = z.object({
-  is_cargo_order: z.boolean(),
-  confidence: z.number().min(0).max(1),
-  found_phone_numbers: z.array(z.string()),
+const CargoLoadSchema = z.object({
   origin: z.string().nullable(),
   destination: z.string().nullable(),
   cargo_type: z.string().nullable(),
@@ -22,16 +21,23 @@ const CargoExtractionSchema = z.object({
   extra_notes: z.string().nullable(),
 });
 
-type CargoExtraction = z.infer<typeof CargoExtractionSchema>;
+const CargoExtractionSchema = z.object({
+  is_cargo_order: z.boolean(),
+  confidence: z.number().min(0).max(1),
+  found_phone_numbers: z.array(z.string()),
+  loads: z.array(CargoLoadSchema),
+});
+
+/** یک بار (یک مسیر مبدا-مقصد مستقل) داخل پیام. */
+export type CargoLoad = z.infer<typeof CargoLoadSchema>;
 
 // ------------------------------------------------------------------
 // خروجی نهایی متد استخراج -- فقط فیلدهای خام، بدون متن نهایی. ساخت متن
-// نهایی کاملاً بر عهده‌ی WhatsappService است (چون اونجا هم به orderNumber
-// دیتابیس دسترسی داره، هم جایی است که پیام خام از گروه دریافت و ذخیره
-// می‌شود). این سرویس فقط مسئول فراخوانی مدل و اعتبارسنجی خروجیه، هیچ
-// منطق کسب‌وکاری (business logic) دیگری اینجا نباید باشد.
+// نهایی (با کد پیگیری) بر عهده‌ی CargoPipelineService است. این سرویس فقط
+// مسئول فراخوانی مدل و اعتبارسنجی خروجیه، هیچ منطق کسب‌وکاری دیگری
+// اینجا نباید باشد.
 // ------------------------------------------------------------------
-export type CargoOrderExtraction = CargoExtraction;
+export type CargoOrderExtraction = z.infer<typeof CargoExtractionSchema>;
 
 @Injectable()
 class TransportOrderService {
@@ -88,26 +94,32 @@ class TransportOrderService {
           is_cargo_order: { type: 'boolean' },
           confidence: { type: 'number' },
           found_phone_numbers: { type: 'array', items: { type: 'string' } },
-          origin: { type: ['string', 'null'] },
-          destination: { type: ['string', 'null'] },
-          cargo_type: { type: ['string', 'null'] },
-          weight: { type: ['string', 'null'] },
-          vehicle_type: { type: ['string', 'null'] },
-          price: { type: ['string', 'null'] },
-          extra_notes: { type: ['string', 'null'] },
+          loads: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                origin: { type: ['string', 'null'] },
+                destination: { type: ['string', 'null'] },
+                cargo_type: { type: ['string', 'null'] },
+                weight: { type: ['string', 'null'] },
+                vehicle_type: { type: ['string', 'null'] },
+                price: { type: ['string', 'null'] },
+                extra_notes: { type: ['string', 'null'] },
+              },
+              required: [
+                'origin',
+                'destination',
+                'cargo_type',
+                'weight',
+                'vehicle_type',
+                'price',
+                'extra_notes',
+              ],
+            },
+          },
         },
-        required: [
-          'is_cargo_order',
-          'confidence',
-          'found_phone_numbers',
-          'origin',
-          'destination',
-          'cargo_type',
-          'weight',
-          'vehicle_type',
-          'price',
-          'extra_notes',
-        ],
+        required: ['is_cargo_order', 'confidence', 'found_phone_numbers', 'loads'],
       },
     };
 
@@ -143,10 +155,26 @@ class TransportOrderService {
       );
     }
 
+    // «بار هست» بدون هیچ بار استخراج‌شده، یا بار استخراج‌شده با «بار نیست» --
+    // هر دو یعنی پیام بار نیست؛ ناسازگاری مدل نباید رکورد خالی یا بار گم‌شده بسازه.
+    const data = validation.data;
+    if (!data.is_cargo_order || data.loads.length === 0) {
+      return { ...data, is_cargo_order: false, loads: [] };
+    }
+
+    // مدل گاهی به‌جای null رشته‌ی خالی می‌ده -- برای توزیع‌کننده یکسان می‌شه.
+    const loads = data.loads.map((load) => {
+      const cleaned = { ...load };
+      for (const key of Object.keys(cleaned) as (keyof CargoLoad)[]) {
+        if (!cleaned[key]?.trim()) cleaned[key] = null;
+      }
+      return cleaned;
+    });
+
     // فقط فیلدهای خام برمی‌گرده -- ساخت متن نهایی (با کد سفارش) بر عهده‌ی
     // فراخواننده‌ست، چون اون به orderNumber دیتابیس دسترسی داره.
-    return validation.data;
+    return { ...data, loads };
   }
 }
 
-export { TransportOrderService, CargoExtractionSchema };
+export { TransportOrderService, CargoExtractionSchema, CargoLoadSchema };

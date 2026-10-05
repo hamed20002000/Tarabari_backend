@@ -1,18 +1,14 @@
-import { CargoOrderExtraction } from '../services/aiTools.service';
+import { CargoLoad } from '../services/aiTools.service';
 
 /**
- * متن نهایی یک سفارش بار (برای توزیع‌کننده) -- مشترک بین همه‌ی پلتفرم‌ها
+ * متن نهایی یک بار (یکی از loads پیام، برای توزیع‌کننده) -- مشترک بین همه‌ی پلتفرم‌ها
  * تا خروجی هر دو پلتفرم یکسان باشه. شماره‌ی تماس اینجا نوشته نمی‌شه:
  * transport_backend شماره‌ی هر ثبت‌کننده (User.mobile) رو خودش اضافه می‌کنه.
  */
 export function buildCargoProcessedText(
-  data: CargoOrderExtraction,
+  data: CargoLoad,
   orderCode?: string,
 ): string {
-  if (!data.is_cargo_order) {
-    return '';
-  }
-
   const lines: string[] = [];
 
   if (data.cargo_type) {

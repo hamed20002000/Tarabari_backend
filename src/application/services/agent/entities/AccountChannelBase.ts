@@ -76,7 +76,7 @@ export abstract class AccountMonitoredChannelBase {
 /**
  * ستون‌های مشترک پیام‌های بارِ تشخیص‌داده‌شده از گروه/کانال‌های تلگرام، بله و
  * روبیکا. فقط پیام‌هایی که بار هستن ذخیره می‌شن. chatId و messageId رو هر
- * پلتفرم با نوع خودش تعریف می‌کنه (یکتایی روی جفت این دو هست).
+ * پلتفرم با نوع خودش تعریف می‌کنه (یکتایی روی این دو + cargoIndex هست).
  */
 export abstract class AccountChannelMessageBase {
   @PrimaryGeneratedColumn('uuid')
@@ -90,6 +90,11 @@ export abstract class AccountChannelMessageBase {
   chatId: string;
 
   messageId: string | number;
+
+  // یک پیام ممکنه چند بار (چند مسیر مستقل) داشته باشه -- هر بار یک رکورد با
+  // شماره‌ی ترتیبش در پیام؛ یکتایی روی (chatId, messageId, cargoIndex) هست.
+  @Column({ type: 'integer', default: 0 })
+  cargoIndex: number;
 
   @Column('text')
   rawText: string;
