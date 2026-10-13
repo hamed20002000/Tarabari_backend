@@ -1,3 +1,5 @@
+import { createHash } from 'crypto';
+
 /**
  * یکسان‌سازی متن فارسی برای مقایسه: ی/ک عربی به فارسی، ارقام فارسی/عربی به
  * لاتین، حذف کاراکترهای نامرئی و فاصله‌های اضافه، و حروف کوچک. هم برای هش
@@ -14,4 +16,14 @@ export function normalizePersianText(text: string): string {
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
+}
+
+/**
+ * هش متن برای تشخیص آگهی تکراری: علاوه بر normalizePersianText، ایموجی،
+ * علامت‌ها و فاصله‌ها هم حذف می‌شن -- پست دوباره با فاصله/ایموجی متفاوت هم
+ * همون هش رو می‌ده.
+ */
+export function cargoTextHash(text: string): string {
+  const core = normalizePersianText(text).replace(/[^\p{L}\p{N}]+/gu, '');
+  return createHash('sha256').update(core).digest('hex');
 }

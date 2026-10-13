@@ -24,6 +24,7 @@ import { RubikaMonitoredChannel } from './application/services/agent/entities/Ru
 import { RubikaChannelMessage } from './application/services/agent/entities/RubikaChannelMessage';
 import { MessengerSession } from './application/services/agent/entities/MessengerSession';
 import { OutboxEvent } from './application/services/agent/entities/OutboxEvent';
+import { CargoTextFingerprint } from './application/services/agent/entities/CargoTextFingerprint';
 import { CandidateListing } from './application/services/agent/entities/CandinateList';
 import { CargoSubscription } from './application/services/agent/entities/CargoSubscription';
 // NEW: ماژول کنترلر پنل مدیر برای افزودن/حذف گروه و کانال
@@ -85,6 +86,7 @@ import { InternalApiKeyGuard } from './infrastructure/security/internalApiKey.gu
           RubikaChannelMessage,
           MessengerSession,
           OutboxEvent,
+          CargoTextFingerprint,
           CandidateListing,
           CargoSubscription,
         ],

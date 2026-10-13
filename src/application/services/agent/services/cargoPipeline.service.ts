@@ -1,9 +1,15 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource, DeepPartial, EntityManager, EntityTarget, ObjectLiteral } from 'typeorm';
 import { OutboxEvent } from '../entities/OutboxEvent';
 import { TransportOrderService, CargoOrderExtraction } from './aiTools.service';
 import { buildCargoProcessedText } from '../common/cargoText';
+import { cargoTextHash } from '../utils/persianText';
+import { snapPlaceName } from '../utils/placeNames';
+
+// متن تکراری تا این مدت (ساعت) دوباره پردازش و ارسال نمی‌شه.
+const DUPLICATE_WINDOW_HOURS = Number(process.env.CARGO_DUPLICATE_WINDOW_HOURS) || 24;
 
 export interface CargoCandidate<T extends CargoMessageRecord> {
   /** برای لاگ‌ها، مثلاً شناسه‌ی گروه/کانال. */
@@ -55,13 +61,24 @@ export class CargoPipelineService {
 
     this.logger.log(`📩 ${isVoice ? 'پیام صوتی' : 'پیام'} جدید [${label}]: ${text.slice(0, 80)}...`);
 
+    // همون آگهی که دوباره پست شده (یا در گروه/پلتفرم دیگه‌ای پخش شده) شناسه‌ی
+    // پیام جدید داره -- فقط ثبت‌کننده‌هایی که این متن رو هنوز نگرفتن می‌مونن.
+    const contentHash = cargoTextHash(text);
+    const ownerUserIds = await this.claimOwners(contentHash, candidate.ownerUserIds);
+    if (ownerUserIds.length === 0) {
+      this.logger.log(`⏭️ پیام تکراری رد شد [${label}]`);
+      return null;
+    }
+    candidate = { ...candidate, ownerUserIds };
+
     try {
       const startedAt = Date.now();
       this.logger.log(
         `⏱️ فراخوانی مدل شروع شد [${label}] -- در صف مدل: ${this.transportOrderService.pendingCount}`,
       );
 
-      const extraction = await this.transportOrderService.DetermineTextIsTransportOrder(text);
+      const detected = await this.transportOrderService.DetermineTextIsTransportOrder(text);
+      const extraction = isVoice ? this.snapVoicePlaces(detected, label) : detected;
 
       this.logger.log(`⏱️ فراخوانی مدل تموم شد [${label}] -- ${Date.now() - startedAt}ms طول کشید`);
 
@@ -73,8 +90,64 @@ export class CargoPipelineService {
       return extraction;
     } catch (error) {
       this.logger.error(`تحلیل پیام ناموفق بود [${label}]`, error as Error);
+      // پردازش نشد -- پست بعدی همین متن نباید تکراری حساب بشه.
+      await this.releaseOwners(contentHash, ownerUserIds).catch(() => undefined);
       return null;
     }
+  }
+
+  /**
+   * whisper اسم شهرها رو گاهی آوایی و اشتباه می‌نویسه («تبیز»، «زایدان») --
+   * مبدا/مقصد بارهای ویس به نزدیک‌ترین شهر/مرز شناخته‌شده اصلاح می‌شن.
+   * (متن تایپ‌شده دست نمی‌خوره؛ اونجا املای کاربر معتبرتره.)
+   */
+  private snapVoicePlaces(extraction: CargoOrderExtraction, label: string): CargoOrderExtraction {
+    const loads = extraction.loads.map((load) => {
+      const origin = snapPlaceName(load.origin);
+      const destination = snapPlaceName(load.destination);
+      if (origin !== load.origin || destination !== load.destination) {
+        this.logger.log(
+          `🗺️ اصلاح اسم شهر در ویس [${label}]: ${load.origin} → ${origin}، ${load.destination} → ${destination}`,
+        );
+      }
+      return { ...load, origin, destination };
+    });
+    return { ...extraction, loads };
+  }
+
+  /**
+   * اتمیک: ثبت‌کننده‌هایی که این متن رو در DUPLICATE_WINDOW_HOURS گذشته
+   * نگرفتن، برای این پیام رزرو می‌شن و برگردونده می‌شن (پلتفرم‌ها صف جدا
+   * دارن و ممکنه هم‌زمان همون آگهی رو بفرستن). پیام غیربار هم رزرو می‌مونه
+   * تا تکرارش دوباره به مدل نره.
+   */
+  private async claimOwners(contentHash: string, ownerUserIds: string[]): Promise<string[]> {
+    if (ownerUserIds.length === 0) return [];
+    const rows: { userId: string }[] = await this.dataSource.query(
+      `INSERT INTO "cargo_text_fingerprint" ("contentHash", "userId", "seenAt")
+       SELECT $1, u, now() FROM unnest($2::varchar[]) AS u
+       ON CONFLICT ("contentHash", "userId") DO UPDATE SET "seenAt" = EXCLUDED."seenAt"
+       WHERE "cargo_text_fingerprint"."seenAt" < now() - make_interval(hours => $3)
+       RETURNING "userId"`,
+      [contentHash, ownerUserIds, DUPLICATE_WINDOW_HOURS],
+    );
+    return rows.map((row) => row.userId);
+  }
+
+  private async releaseOwners(contentHash: string, ownerUserIds: string[]): Promise<void> {
+    await this.dataSource.query(
+      `DELETE FROM "cargo_text_fingerprint" WHERE "contentHash" = $1 AND "userId" = ANY($2::varchar[])`,
+      [contentHash, ownerUserIds],
+    );
+  }
+
+  @Cron('23 * * * *')
+  async purgeOldFingerprints(): Promise<void> {
+    await this.dataSource
+      .query(`DELETE FROM "cargo_text_fingerprint" WHERE "seenAt" < now() - make_interval(hours => $1)`, [
+        DUPLICATE_WINDOW_HOURS,
+      ])
+      .catch((error) => this.logger.error('پاک‌سازی اثر انگشت پیام‌ها ناموفق بود', error as Error));
   }
 
   private async saveCargo<T extends CargoMessageRecord>(

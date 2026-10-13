@@ -1,29 +1,87 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFile } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
 
 const execFileAsync = promisify(execFile);
 
+const LOCAL_FILES = join(process.cwd(), 'src/application/services/agent/localFiles');
+
+// برش فرکانس‌های خیلی پایین/بالا (لرزش میکروفون، نویز) و یکسان کردن بلندی صدا؛
+// ویس‌های پیام‌رسان معمولاً یا خیلی آرومن یا clip شدن.
+const AUDIO_FILTER = 'highpass=f=80,lowpass=f=7600,loudnorm';
+
+export interface WhisperOptions {
+  /** اسم فایل داخل models/ یا مسیر کامل */
+  model: string;
+  /** واژه‌های حوزه‌ی کار که whisper باید انتظارشون رو داشته باشه؛ خالی یعنی بدون prompt */
+  prompt: string;
+  /** حذف سکوت‌ها با Silero قبل از whisper */
+  vad: boolean;
+}
+
+interface TranscriptCorrection {
+  from: RegExp;
+  to: string;
+}
+
+/**
+ * whisper روی سکوت، موسیقی و صدای نامفهوم متن ساختگی می‌سازه («زیرنویس …»،
+ * «از از از از»، یا خود prompt) -- چنین خروجی‌ای یعنی چیزی تشخیص داده نشد و
+ * نباید به مدل تشخیص بار بره.
+ */
+export function cleanTranscript(raw: string, prompt = ''): string {
+  const text = raw
+    .replace(/\[[^\]]*\]|\([^)]*\)/g, ' ') // [BLANK_AUDIO]، (موسیقی)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '';
+  if (/زیرنویس|amara|subtitle/i.test(text)) return '';
+  // گفتار فارسی که نه حرف فارسی داره نه عدد، حدس مدل روی صدای نامفهومه.
+  if (!/[؀-ۿ\p{N}]/u.test(text)) return '';
+  if (text.length >= 15 && prompt.includes(text.replace(/[.،,]+$/, ''))) return '';
+
+  const words = text.split(' ');
+  if (words.length >= 3 && new Set(words).size === 1) return '';
+  return text;
+}
+
+function loadCorrections(): TranscriptCorrection[] {
+  try {
+    const rules = JSON.parse(readFileSync(join(LOCAL_FILES, 'stt_corrections.json'), 'utf8')) as {
+      from: string;
+      to: string;
+    }[];
+    return rules.map((rule) => ({ from: new RegExp(rule.from, 'gu'), to: rule.to }));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * تبدیل پیام صوتی به متن با whisper.cpp (محلی، بدون سرویس خارجی) -- مشترک
- * بین گروه/کانال‌های بار واتساپ و تلگرام و بات تلگرام.
+ * بین گروه/کانال‌های بار همه‌ی پلتفرم‌ها.
  *
- * whisper روی CPU اجرا می‌شه و سنگینه، برای همین درخواست‌ها پشت‌سرهم
- * (نه هم‌زمان) اجرا می‌شن.
+ * whisper سنگینه، برای همین درخواست‌ها پشت‌سرهم (نه هم‌زمان) اجرا می‌شن.
+ * اگه whisper.cpp با CUDA ساخته شده باشه، خودش از GPU استفاده می‌کنه.
  */
 @Injectable()
 export class SpeechToTextService {
   private readonly logger = new Logger(SpeechToTextService.name);
 
   private readonly whisperDir = process.env.WHISPER_CPP_DIR || '/home/hamed/whisper.cpp';
-  private readonly whisperBinary = join(this.whisperDir, 'build', 'bin', 'whisper-cli');
-  private readonly modelPath =
-    process.env.WHISPER_MODEL_PATH || join(this.whisperDir, 'models', 'ggml-large-v3-q5_0.bin');
+  // build-cuda: ساخت با GPU (اگه هست)؛ وگرنه ساخت CPU.
+  private readonly whisperBinary =
+    process.env.WHISPER_CLI ||
+    [join(this.whisperDir, 'build-cuda', 'bin', 'whisper-cli'), join(this.whisperDir, 'build', 'bin', 'whisper-cli')].find(
+      (path) => existsSync(path),
+    ) ||
+    join(this.whisperDir, 'build', 'bin', 'whisper-cli');
   private readonly language = process.env.WHISPER_LANGUAGE || 'fa';
   // نصف هسته‌ها -- بقیه برای خود برنامه و Ollama آزاد می‌مونه.
   private readonly threads = Math.max(4, Math.floor(cpus().length / 2));
@@ -31,18 +89,32 @@ export class SpeechToTextService {
   // /tmp برنامه رو نمی‌بینه.
   private readonly workDir = process.env.VOICE_WORK_DIR || join(process.cwd(), 'uploads', 'voice-tmp');
 
+  private readonly defaults: WhisperOptions = {
+    model: process.env.WHISPER_MODEL_PATH || 'ggml-large-v3-q5_0.bin',
+    prompt: this.defaultPrompt(),
+    vad: process.env.WHISPER_VAD !== 'off',
+  };
+  private readonly vadModel = this.existingPath(process.env.WHISPER_VAD_MODEL || 'ggml-silero-v6.2.0.bin');
+  private readonly corrections = loadCorrections();
+  // اختیاری: هر ویس (بعد از فیلتر) و متنش اینجا می‌مونه تا نمونه‌ی ارزیابی/آموزش بشه.
+  private readonly sampleDir = process.env.STT_SAMPLE_DIR || null;
+
   /** پیام‌های صوتی طولانی‌تر از این (ثانیه) پردازش نمی‌شن تا صف قفل نشه. */
   static readonly MAX_DURATION_SECONDS = Number(process.env.VOICE_MAX_DURATION_SECONDS) || 180;
   private static readonly TIMEOUT_MS = 5 * 60 * 1000;
 
   private readonly queue = new SerialTaskQueue();
 
+  get vadAvailable(): boolean {
+    return this.vadModel !== null;
+  }
+
   /**
-   * فایل صوتی (ogg/opus واتساپ و تلگرام یا هر فرمتی که ffmpeg بشناسه) رو
-   * به متن تبدیل می‌کنه. اگه صدایی تشخیص داده نشه، رشته‌ی خالی برمی‌گردونه.
+   * فایل صوتی (ogg/opus پیام‌رسان‌ها یا هر فرمتی که ffmpeg بشناسه) رو به متن
+   * تبدیل می‌کنه. اگه گفتاری تشخیص داده نشه، رشته‌ی خالی برمی‌گردونه.
    */
-  transcribe(audio: Buffer, extension = 'ogg'): Promise<string> {
-    return this.queue.run(() => this.runTranscription(audio, extension));
+  transcribe(audio: Buffer, extension = 'ogg', overrides: Partial<WhisperOptions> = {}): Promise<string> {
+    return this.queue.run(() => this.runTranscription(audio, extension, { ...this.defaults, ...overrides }));
   }
 
   /**
@@ -67,7 +139,11 @@ export class SpeechToTextService {
     }
   }
 
-  private async runTranscription(audio: Buffer, extension: string): Promise<string> {
+  private async runTranscription(audio: Buffer, extension: string, options: WhisperOptions): Promise<string> {
+    if (options.vad && !this.vadModel) {
+      this.logger.warn('مدل VAD پیدا نشد -- بدون VAD ادامه می‌ده (WHISPER_VAD_MODEL رو تنظیم کنید).');
+    }
+
     await mkdir(this.workDir, { recursive: true });
     const id = randomUUID();
     const inputPath = join(this.workDir, `${id}.${extension}`);
@@ -79,29 +155,80 @@ export class SpeechToTextService {
       // whisper فقط WAV مونوی ۱۶ کیلوهرتز می‌خونه.
       await execFileAsync(
         'ffmpeg',
-        ['-y', '-loglevel', 'error', '-i', inputPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath],
+        ['-y', '-loglevel', 'error', '-i', inputPath, '-af', AUDIO_FILTER, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wavPath],
         { timeout: SpeechToTextService.TIMEOUT_MS },
       );
 
+      const args = ['-m', this.modelPath(options.model), '-f', wavPath, '-l', this.language, '-t', String(this.threads), '-nt', '-np'];
+      if (options.prompt) args.push('--prompt', options.prompt);
+      if (options.vad && this.vadModel) args.push('--vad', '-vm', this.vadModel);
+
       const startedAt = Date.now();
-      const { stdout } = await execFileAsync(
-        this.whisperBinary,
-        ['-m', this.modelPath, '-f', wavPath, '-l', this.language, '-t', String(this.threads), '-nt', '-np'],
-        { timeout: SpeechToTextService.TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      const run = (extra: string[]) =>
+        execFileAsync(this.whisperBinary, [...args, ...extra], {
+          timeout: SpeechToTextService.TIMEOUT_MS,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+      // GPU با Ollama (qwen3) مشترکه و حافظه‌اش تنگه -- اگه whisper روی GPU جا
+      // نشد، به‌جای از دست رفتن ویس، روی CPU (کندتر) دوباره اجرا می‌شه.
+      const { stdout } = await run([]).catch((error) => {
+        this.logger.warn(`whisper روی GPU ناموفق بود، اجرا روی CPU: ${(error as Error).message.slice(0, 200)}`);
+        return run(['-ng']);
+      });
+
+      const raw = stdout.split('\n').map((line) => line.trim()).filter(Boolean).join(' ');
+      const text = this.corrections.reduce(
+        (current, rule) => current.replace(rule.from, rule.to),
+        cleanTranscript(raw, options.prompt),
       );
 
-      const text = stdout
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .join(' ')
-        .trim();
-
       this.logger.log(`🎙️ تبدیل صدا به متن انجام شد -- ${Date.now() - startedAt}ms`);
+      if (this.sampleDir) await this.keepSample(wavPath, raw, text);
       return text;
     } finally {
       await rm(inputPath, { force: true }).catch(() => undefined);
       await rm(wavPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  /** فایل X.got.txt رو با متن درستِ گفته‌شده به X.txt تغییر نام بدید تا stt:eval اون رو بسنجه. */
+  private async keepSample(wavPath: string, raw: string, text: string): Promise<void> {
+    try {
+      await mkdir(this.sampleDir!, { recursive: true });
+      const name = join(this.sampleDir!, new Date().toISOString().replace(/[:.]/g, '-'));
+      await copyFile(wavPath, `${name}.wav`);
+      await writeFile(`${name}.got.txt`, `raw: ${raw}\nfinal: ${text}\n`);
+    } catch (error) {
+      this.logger.warn(`نمونه‌ی صوتی ذخیره نشد: ${(error as Error).message}`);
+    }
+  }
+
+  private modelPath(model: string): string {
+    return isAbsolute(model) ? model : join(this.whisperDir, 'models', model);
+  }
+
+  private existingPath(model: string): string | null {
+    const path = this.modelPath(model);
+    return existsSync(path) ? path : null;
+  }
+
+  /**
+   * prompt پیش‌فرض خاموشه: روی ۲۶ نمونه‌ی ارزیابی، prompt واژگان بار CER رو از
+   * ۲۴.۷٪ به ۳۱.۳٪ بدتر کرد. WHISPER_PROMPT=file متن whisper_prompt.txt رو
+   * فعال می‌کنه (برای ارزیابی دوباره روی ویس‌های واقعی کانال‌ها) و هر مقدار
+   * دیگه‌ای خودش prompt می‌شه.
+   */
+  private defaultPrompt(): string {
+    const fromEnv = process.env.WHISPER_PROMPT;
+    if (!fromEnv || fromEnv === 'off') return '';
+    return fromEnv === 'file' ? SpeechToTextService.filePrompt() : fromEnv;
+  }
+
+  static filePrompt(): string {
+    try {
+      return readFileSync(join(LOCAL_FILES, 'whisper_prompt.txt'), 'utf8').replace(/\s+/g, ' ').trim();
+    } catch {
+      return '';
     }
   }
 }

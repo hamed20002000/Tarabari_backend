@@ -23,6 +23,7 @@
     "telegram:login": "ts-node -r tsconfig-paths/register scripts/telegram-login.ts",
     "bale:login": "ts-node -r tsconfig-paths/register scripts/bale-login.ts",
     "rubika:login": "ts-node -r tsconfig-paths/register scripts/rubika-login.ts",
+    "stt:eval": "ts-node -r tsconfig-paths/register scripts/stt-eval.ts",
     "seed": "ts-node -r tsconfig-paths/register src/infrastructure/database/seeds/seed.ts",
     "postinstall": "patch-package"
   },
