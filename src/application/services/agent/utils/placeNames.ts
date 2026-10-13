@@ -1,7 +1,9 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-const PLACES_PATH = join(process.cwd(), 'src/application/services/agent/localFiles/place_names.json');
+const LOCAL_FILES = join(process.cwd(), 'src/application/services/agent/localFiles');
+const PLACES_PATH = join(LOCAL_FILES, 'place_names.json');
+const CONFUSIONS_PATH = join(LOCAL_FILES, 'stt_place_confusions.json');
 
 /**
  * کلید آوایی: حروف هم‌صدا یکی می‌شن (س/ص/ث، ز/ذ/ض/ظ، ت/ط، ه/ح، ق/غ، ا/ع/آ)
@@ -56,6 +58,7 @@ interface Place {
 
 let places: Place[] | null = null;
 let byKey: Map<string, Place> | null = null;
+let confusions: Map<string, string> | null = null;
 
 function load(): void {
   if (places) return;
@@ -67,6 +70,16 @@ function load(): void {
     ];
   } catch {
     places = [];
+  }
+  try {
+    const data = JSON.parse(readFileSync(CONFUSIONS_PATH, 'utf8')) as Record<string, string>;
+    confusions = new Map(
+      Object.entries(data)
+        .filter(([from]) => !from.startsWith('_'))
+        .map(([from, to]) => [phoneticKey(from), to]),
+    );
+  } catch {
+    confusions = new Map();
   }
   byKey = new Map();
   // شهر بزرگ اول ثبت می‌شه و هم‌نامِ کوچک جاش رو نمی‌گیره.
@@ -82,7 +95,13 @@ function load(): void {
 export function snapPlaceName(value: string | null): string | null {
   if (!value) return value;
   load();
-  const words = value.trim().split(/\s+/);
+  // اشتباه‌های شناخته‌شده‌ی whisper («تیران» ← «تهران») -- قبل از همه، چون
+  // اسم اشتباه ممکنه خودش یک شهر واقعی باشه و پایین‌تر «درست» حساب بشه.
+  const words = value
+    .trim()
+    .split(/\s+/)
+    .map((word) => confusions!.get(phoneticKey(word)) ?? word);
+  if (words.join(' ') !== value.trim()) return snapPlaceName(words.join(' '));
 
   for (let size = Math.min(3, words.length); size >= 1; size--) {
     for (let start = 0; start + size <= words.length; start++) {

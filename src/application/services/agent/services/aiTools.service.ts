@@ -28,6 +28,8 @@ const CargoExtractionSchema = z.object({
   loads: z.array(CargoLoadSchema),
 });
 
+const GENERIC_CARGO_TYPES = new Set(['بار', 'باره', 'بارها', 'بارِ', 'محموله']);
+
 /** یک بار (یک مسیر مبدا-مقصد مستقل) داخل پیام. */
 export type CargoLoad = z.infer<typeof CargoLoadSchema>;
 
@@ -168,6 +170,8 @@ class TransportOrderService {
       for (const key of Object.keys(cleaned) as (keyof CargoLoad)[]) {
         if (!cleaned[key]?.trim()) cleaned[key] = null;
       }
+      // خود کلمه‌ی «بار» نوع بار نیست («بار: بار» در اعلان بی‌معنیه) -- مدل گاهی برش می‌داره.
+      if (cleaned.cargo_type && GENERIC_CARGO_TYPES.has(cleaned.cargo_type.trim())) cleaned.cargo_type = null;
       return cleaned;
     });
 

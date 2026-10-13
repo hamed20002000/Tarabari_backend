@@ -23,6 +23,10 @@ import {
 import { randomBetween, sleep } from '../common/delay';
 import { buildTelegramClientParams, getTelegramApiCredentials } from './telegramClient.config';
 
+// اتصال ناموفق (قطعی شبکه/فیلتر موقع استارت) -- با فاصله‌ی ۱، ۲، ۴ ... تا ۳۰ دقیقه دوباره تلاش می‌شه.
+const RECONNECT_BASE_DELAY_MS = 60_000;
+const RECONNECT_MAX_DELAY_MS = 30 * 60_000;
+
 export type ParsedIdentifier = { kind: 'invite'; hash: string } | { kind: 'username'; username: string };
 
 const PERMANENT_JOIN_ERRORS: Record<string, string> = {
@@ -48,6 +52,10 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
   // آخرین بررسی عضویت هر کانال بعد از UpdateChannel -- جلوی استعلام‌های پشت‌سرهم رو می‌گیره.
   private readonly lastRemovalCheckAt = new Map<string, number>();
   private isReconciling = false;
+  private session: string | null = null;
+  private stopped = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
 
   constructor(
     @InjectRepository(TelegramMonitoredChannel)
@@ -68,10 +76,39 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
   }
 
   protected async disconnect(): Promise<void> {
-    await this.client?.disconnect();
+    this.stopped = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    await this.client?.destroy();
   }
 
+  //#region ----------------- اتصال؛ اگه ناموفق بود (مثلاً تلگرام موقع استارت در دسترس نبود) دوباره تلاش می‌شه -----
+  // قبلاً یک خطای شبکه موقع استارت، مانیتورینگ تلگرام رو تا ری‌استارت بعدی بی‌صدا خاموش می‌کرد.
   protected async connect(session: string): Promise<void> {
+    this.session = session;
+    try {
+      await this.connectOnce(session);
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      this.scheduleReconnect(error);
+    }
+  }
+
+  private scheduleReconnect(error: unknown): void {
+    if (this.stopped || this.reconnectTimer || !this.session) return;
+    const delayMs = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_DELAY_MS);
+    this.reconnectAttempts += 1;
+    this.logger.warn(
+      `اتصال به تلگرام ناموفق بود (${(error as Error)?.message ?? error}) -- ${delayMs / 1000} ثانیه‌ی دیگه دوباره تلاش می‌شه (تلاش #${this.reconnectAttempts}).`,
+    );
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect(this.session!);
+    }, delayMs);
+  }
+  //#endregion ---------------------------------------------------------------------------------------------------
+
+  private async connectOnce(session: string): Promise<void> {
 
     //#region ----------------- برای استخراج api_idو api_hash ------------------
     const credentials = getTelegramApiCredentials();
@@ -93,6 +130,17 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
 
     client.setLogLevel(LogLevel.ERROR);// برای جلوگیری از جاپ های بی مورد الان فقط خطاها تو کنسول نشون داده میشن
 
+    // اتصال نیمه‌کاره (مثلاً getDialogs خطا داد) باید بسته بشه -- وگرنه تلاش بعدی
+    // یک اتصال دوم با همون نشست می‌ساخت (AUTH_KEY_DUPLICATED، ریسک بن).
+    try {
+      await this.setUpClient(client, session);
+    } catch (error) {
+      await client.destroy().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async setUpClient(client: TelegramClient, session: string): Promise<void> {
     //#region ------------------ اتصال به تلگرام -------------------
     await client.connect();
 
@@ -107,6 +155,7 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
     const savedSession = client.session.save() as unknown as string;
     if (savedSession && savedSession !== session) {
       await this.updateSession(savedSession);
+      this.session = savedSession;
     }
 
     //#endregion -------------------------------------------------------------------------------------------------------------
@@ -302,9 +351,18 @@ export class TelegramChannelService extends AccountChannelMonitor<TelegramMonito
   //#region -------------- GramJS گاهی بعد از مدت طولانی بی‌کاری دریافت آپدیت‌های کانال رو متوقف  می‌کنه؛ یک درخواست سبک دوره‌ای اتصال آپدیت‌ها رو زنده نگه می‌داره.------
   @Cron('*/5 * * * *')
   async keepUpdatesAlive(): Promise<void> {
-    if (!this.client) return;
+    const client = this.client;
+    if (!client) return;
+    // autoReconnect خود GramJS بعد از تموم شدن connectionRetries تسلیم می‌شه و کلاینت
+    // بی‌صدا قطع می‌مونه -- اینجا کلاینت مرده بسته و از اول وصل می‌شه.
+    if (!client.connected) {
+      this.client = null;
+      await client.destroy().catch(() => undefined);
+      this.scheduleReconnect(new Error('اتصال تلگرام قطع شده و GramJS دوباره وصل نشد'));
+      return;
+    }
     try {
-      await this.client.invoke(new Api.updates.GetState());
+      await client.invoke(new Api.updates.GetState());
     } catch (error) {
       this.logger.warn(`keep-alive تلگرام ناموفق بود: ${(error as Error).message}`);
     }
