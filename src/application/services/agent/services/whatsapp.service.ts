@@ -12,6 +12,7 @@ import makeWASocket, {
   downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
+import { Agent as HttpsAgent } from 'https';
 import * as qrcode from 'qrcode-terminal';
 import { WhatsappAuthCredential } from '../entities/WhatsappAuthCredential';
 import { WhatsappAuthKey } from '../entities/WhatsappAuthKey';
@@ -122,6 +123,8 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
   private isShuttingDown = false;
+  // صبر تا نوشتن‌های در جریان نشست توی دیتابیس تموم بشه (از useDbAuthState).
+  private flushAuthState: () => Promise<void> = async () => undefined;
 
   private lastJoinRequestAt = 0;
   private recentJoinTimes: number[] = [];
@@ -158,11 +161,19 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
    * قبلی و جدید چند لحظه هم‌زمان با یک نشست وصل می‌موندن -- واتساپ این رو
    * conflict می‌بینه و تکرارش می‌تونه دستگاه رو از حساب جدا کنه.
    */
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
     this.isShuttingDown = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.sock?.end(undefined);
+    // قبل از بسته شدن اتصال دیتابیس، آخرین creds/کلیدها ذخیره بشن؛ وگرنه
+    // نشستِ ذخیره‌شده از نشست واقعی عقب می‌موند.
+    await Promise.race([
+      this.flushAuthState().catch((error) =>
+        this.logger.error('ذخیره‌ی نهایی نشست واتساپ ناموفق بود', error as Error),
+      ),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
   }
 
   /**
@@ -185,17 +196,29 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
     }, delayMs);
   }
 
-  private async clearAuthState(): Promise<void> {
-    await this.keyRepo.delete({ sessionId: DEFAULT_SESSION_ID });
-    await this.credentialRepo.delete({ sessionId: DEFAULT_SESSION_ID });
+  /**
+   * نشست logout‌شده پاک نمی‌شه؛ با یه sessionId دیگه بکاپ می‌شه تا اگه logout
+   * اشتباهی بود یا خواستیم علتش رو بررسی کنیم، داده از دست نره. نشست اصلی
+   * خالی می‌شه تا QR جدید نمایش داده بشه.
+   */
+  private async archiveAuthState(): Promise<string> {
+    const archiveId = `${DEFAULT_SESSION_ID}-loggedout-${Date.now()}`;
+    await this.credentialRepo.manager.transaction(async (manager) => {
+      await manager.update(WhatsappAuthKey, { sessionId: DEFAULT_SESSION_ID }, { sessionId: archiveId });
+      await manager.update(WhatsappAuthCredential, { sessionId: DEFAULT_SESSION_ID }, { sessionId: archiveId });
+    });
+    return archiveId;
   }
 
   private async connect(): Promise<void> {
-    const { state, saveCreds } = await useDbAuthState(
+    // نوشتن‌های نیمه‌کاره‌ی سوکت قبلی اول تموم بشن، بعد نشست از دیتابیس خونده بشه.
+    await this.flushAuthState();
+    const { state, saveCreds, flush } = await useDbAuthState(
       DEFAULT_SESSION_ID,
       this.credentialRepo,
       this.keyRepo,
     );
+    this.flushAuthState = flush;
 
     // fetch داخل fetchLatestBaileysVersion مهلت نداره -- با شبکه‌ی کند اتصال گیر می‌کرد.
     const { version, isLatest } = await Promise.race([
@@ -210,6 +233,9 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       auth: state,
       // بدون version، نسخه‌ی پیش‌فرض خود Baileys استفاده می‌شه (undefined پیش‌فرض رو خراب می‌کرد).
       ...(version ? { version } : {}),
+      // DNS برای web.whatsapp.com اول IPv6 برمی‌گردونه و روی شبکه‌ی بدون IPv6
+      // وب‌سوکت با ENETUNREACH (کد 408) بسته می‌شد و هیچ‌وقت QR نمی‌اومد.
+      agent: new HttpsAgent({ family: 4 }),
       printQRInTerminal: false,
     });
 
@@ -224,8 +250,13 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
 
       if (connection === 'close') {
         this.isConnected = false;
-        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        this.logger.warn(`اتصال واتساپ قطع شد (کد ${statusCode}).`);
+        const disconnectError = lastDisconnect?.error as Boom | undefined;
+        const statusCode = disconnectError?.output?.statusCode;
+        this.logger.warn(
+          `اتصال واتساپ قطع شد (کد ${statusCode}): ${disconnectError?.message ?? '-'} ${
+            disconnectError?.data ? JSON.stringify(disconnectError.data) : ''
+          }`,
+        );
         if (this.isShuttingDown) return;
 
         if (statusCode === DisconnectReason.restartRequired) {
@@ -244,10 +275,14 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
         } else {
           // کلیدهای نشستِ logout‌شده دیگه به درد نمی‌خورن و با وجودشون هر
           // اتصال دوباره هم 401 می‌گیره -- پاک می‌شن تا QR جدید نمایش داده بشه.
-          this.logger.error('نشست بسته شد (loggedOut). کلیدهای قبلی پاک می‌شن و QR جدید نمایش داده می‌شه.');
-          void this.clearAuthState()
-            .then(() => this.scheduleReconnect())
-            .catch((error) => this.logger.error('پاک کردن نشست واتساپ ناموفق بود', error as Error));
+          this.logger.error('نشست بسته شد (loggedOut). نشست قبلی بکاپ می‌شه و QR جدید نمایش داده می‌شه.');
+          void this.flushAuthState()
+            .then(() => this.archiveAuthState())
+            .then((archiveId) => {
+              this.logger.warn(`نشست logout‌شده با sessionId «${archiveId}» بکاپ شد.`);
+              this.scheduleReconnect();
+            })
+            .catch((error) => this.logger.error('بکاپ نشست واتساپ ناموفق بود', error as Error));
         }
       } else if (connection === 'open') {
         this.isConnected = true;
