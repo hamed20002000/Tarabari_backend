@@ -59,7 +59,12 @@ class TransportOrderService {
   );
   private readonly OLLAMA_URL = 'http://localhost:11434/api/chat';
   private readonly MODEL = 'qwen3:8b';
-  private readonly REQUEST_TIMEOUT_MS = 60000;
+  // درخواست‌ها پشت‌سرهم اجرا می‌شن، پس این مهلت فقط زمان پردازش خود مدله
+  // (حدود ۳۵-۶۰ ثانیه روی این GPU)؛ ۶۰ ثانیه کم بود و پیام‌ها از دست می‌رفتن.
+  private readonly REQUEST_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 180000;
+  // پرامپت سیستم به‌تنهایی ~۳۸۰۰ توکنه؛ با context پیش‌فرض ۴۰۹۶، متن پیام و
+  // JSON خروجی جا نمی‌شدن و Ollama ورودی رو می‌برید.
+  private readonly CONTEXT_LENGTH = 8192;
 
   private loadSystemPrompt(): string {
     try {
@@ -86,7 +91,11 @@ class TransportOrderService {
       ],
       stream: false,
       think: false, // غیرفعال کردن تفکر داخلی -- تقریباً نصف می‌کنه زمان پاسخ رو
+      // بعد از ۵ دقیقه بی‌کاری (پیش‌فرض) مدل از حافظه خارج و اولین پیام بعدی با
+      // لود دوباره کند می‌شد.
+      keep_alive: '30m',
       options: {
+        num_ctx: this.CONTEXT_LENGTH,
         temperature: 0,
         repeat_penalty: 1.1,
       },

@@ -13,6 +13,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import { Agent as HttpsAgent } from 'https';
+import pino from 'pino';
 import * as qrcode from 'qrcode-terminal';
 import { WhatsappAuthCredential } from '../entities/WhatsappAuthCredential';
 import { WhatsappAuthKey } from '../entities/WhatsappAuthKey';
@@ -236,6 +237,9 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       // DNS برای web.whatsapp.com اول IPv6 برمی‌گردونه و روی شبکه‌ی بدون IPv6
       // وب‌سوکت با ENETUNREACH (کد 408) بسته می‌شد و هیچ‌وقت QR نمی‌اومد.
       agent: new HttpsAgent({ family: 4 }),
+      // لاگر پیش‌فرض Baileys سطح info داره و برای هر پیام/رویداد یه خط JSON
+      // توی ترمینال چاپ می‌کرد؛ فقط هشدار و خطاهاش نمایش داده می‌شه.
+      logger: pino({ level: process.env.WHATSAPP_LOG_LEVEL || 'warn' }),
       printQRInTerminal: false,
     });
 

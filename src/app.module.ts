@@ -93,7 +93,9 @@ import { InternalApiKeyGuard } from './infrastructure/security/internalApiKey.gu
         migrations: ['domain/migrations/*.ts'],
         migrationsRun: false,
         synchronize: false, // Disable auto schema synchronization
-        logging: true, // ['error'], // Log only errors
+        // لاگ همه‌ی کوئری‌ها (مخصوصاً نوشتن کلیدهای واتساپ با هر پیام) ترمینال رو
+        // پر می‌کرد و کلیدهای خصوصی نشست رو هم چاپ می‌کرد. برای دیباگ: DB_LOGGING=true
+        logging: process.env.DB_LOGGING === 'true' ? true : ['error', 'warn'],
         logger: 'advanced-console',
         // NEW: اگه اتصال دیتابیس در لحظه‌ی استارت یا بعداً قطع بشه، به‌جای
         // اینکه بلافاصله fail کنه (و باعث uncaughtException بشه)، تا ۱۰ بار
