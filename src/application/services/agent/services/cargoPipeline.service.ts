@@ -3,9 +3,9 @@ import { Cron } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource, DeepPartial, EntityManager, EntityTarget, ObjectLiteral } from 'typeorm';
 import { OutboxEvent } from '../entities/OutboxEvent';
-import { TransportOrderService, CargoOrderExtraction } from './aiTools.service';
+import { TransportOrderService, CargoOrderExtraction, CargoLoad } from './aiTools.service';
 import { buildCargoProcessedText } from '../common/cargoText';
-import { cargoTextHash } from '../utils/persianText';
+import { cargoLineHashes, cargoLoadHash, cargoTextHash } from '../utils/persianText';
 import { snapPlaceName } from '../utils/placeNames';
 
 // متن تکراری تا این مدت (ساعت) دوباره پردازش و ارسال نمی‌شه.
@@ -69,8 +69,21 @@ export class CargoPipelineService {
       this.logger.log(`⏭️ پیام تکراری رد شد [${label}]`);
       return null;
     }
-    candidate = { ...candidate, ownerUserIds };
 
+    // لیست تقریباً تکراری (همه‌ی خط‌هایش را این ثبت‌کننده در بازه‌ی تکرار گرفته؛ فقط ساعت/
+    // جداکننده/ایموجی فرق دارد) به مدل نمی‌رود. یک خط تازه (مثلاً بار جدید در لیست) کافی است
+    // تا پیام پردازش شود؛ بارهای قبلی‌اش را بعداً تکرار بار رد می‌کند.
+    const lineHashes = cargoLineHashes(text);
+    const seenAll = new Set(await this.ownersWhoSawAllLines(lineHashes, ownerUserIds));
+    const freshOwners = ownerUserIds.filter((userId) => !seenAll.has(userId));
+    if (freshOwners.length === 0) {
+      this.logger.log(`⏭️ لیست تقریباً تکراری رد شد (بدون خط تازه) [${label}]`);
+      return null;
+    }
+    candidate = { ...candidate, ownerUserIds: freshOwners };
+
+    // بارهایی که این پیام رزرو کرد؛ اگر پردازش خطا داد آزاد می‌شوند تا تکرار بعدی از دست نرود
+    let claimedLoads: { hash: string; ownerUserIds: string[] }[] = [];
     try {
       const startedAt = Date.now();
       this.logger.log(
@@ -84,14 +97,20 @@ export class CargoPipelineService {
 
       // پیام‌های غیربار ذخیره نمی‌شن -- فقط سفارش‌های بار وارد دیتابیس می‌شن.
       if (extraction.is_cargo_order) {
-        await this.saveCargo(candidate, extraction);
+        const loads = await this.freshLoads(extraction, freshOwners, label);
+        claimedLoads = loads;
+        if (loads.length) await this.saveCargo(candidate, extraction, loads);
       }
+
+      // بعد از ذخیره‌ی موفق: خط‌های پیام «دیده‌شده» تا تکرار تقریبی بعدی به مدل نرود (بار یا غیربار).
+      await this.markSeen(lineHashes, freshOwners);
 
       return extraction;
     } catch (error) {
       this.logger.error(`تحلیل پیام ناموفق بود [${label}]`, error as Error);
-      // پردازش نشد -- پست بعدی همین متن نباید تکراری حساب بشه.
-      await this.releaseOwners(contentHash, ownerUserIds).catch(() => undefined);
+      // پردازش نشد -- پست بعدی همین متن (و بارهایش) نباید تکراری حساب بشه.
+      await this.releaseOwners([contentHash], ownerUserIds).catch(() => undefined);
+      for (const load of claimedLoads) await this.releaseOwners([load.hash], load.ownerUserIds).catch(() => undefined);
       return null;
     }
   }
@@ -134,11 +153,55 @@ export class CargoPipelineService {
     return rows.map((row) => row.userId);
   }
 
-  private async releaseOwners(contentHash: string, ownerUserIds: string[]): Promise<void> {
+  private async releaseOwners(hashes: string[], ownerUserIds: string[]): Promise<void> {
     await this.dataSource.query(
-      `DELETE FROM "cargo_text_fingerprint" WHERE "contentHash" = $1 AND "userId" = ANY($2::varchar[])`,
-      [contentHash, ownerUserIds],
+      `DELETE FROM "cargo_text_fingerprint" WHERE "contentHash" = ANY($1::varchar[]) AND "userId" = ANY($2::varchar[])`,
+      [hashes, ownerUserIds],
     );
+  }
+
+  /** ثبت‌کننده‌هایی که همه‌ی این خط‌ها را در بازه‌ی تکرار گرفته‌اند. */
+  private async ownersWhoSawAllLines(lineHashes: string[], ownerUserIds: string[]): Promise<string[]> {
+    if (lineHashes.length === 0) return [];
+    const rows: { userId: string }[] = await this.dataSource.query(
+      `SELECT "userId" FROM "cargo_text_fingerprint"
+       WHERE "contentHash" = ANY($1::varchar[]) AND "userId" = ANY($2::varchar[])
+         AND "seenAt" >= now() - make_interval(hours => $3)
+       GROUP BY "userId" HAVING count(*) = $4`,
+      [lineHashes, ownerUserIds, DUPLICATE_WINDOW_HOURS, lineHashes.length],
+    );
+    return rows.map((row) => row.userId);
+  }
+
+  private async markSeen(hashes: string[], ownerUserIds: string[]): Promise<void> {
+    if (hashes.length === 0 || ownerUserIds.length === 0) return;
+    await this.dataSource.query(
+      `INSERT INTO "cargo_text_fingerprint" ("contentHash", "userId", "seenAt")
+       SELECT h, u, now() FROM unnest($1::varchar[]) AS h, unnest($2::varchar[]) AS u
+       ON CONFLICT ("contentHash", "userId") DO UPDATE SET "seenAt" = EXCLUDED."seenAt"`,
+      [hashes, ownerUserIds],
+    );
+  }
+
+  /**
+   * هر بار فقط برای ثبت‌کننده‌هایی که همین بار (مبدا، مقصد، نوع، وزن، خودرو و شماره‌ی
+   * تماس) را در بازه‌ی تکرار از متن دیگری نگرفته‌اند؛ باری که برای همه تکراری است حذف می‌شود.
+   */
+  private async freshLoads(
+    extraction: CargoOrderExtraction,
+    ownerUserIds: string[],
+    label: string,
+  ): Promise<{ load: CargoLoad; hash: string; ownerUserIds: string[] }[]> {
+    const fresh: { load: CargoLoad; hash: string; ownerUserIds: string[] }[] = [];
+    let skipped = 0;
+    for (const load of extraction.loads) {
+      const hash = cargoLoadHash(load, extraction.found_phone_numbers);
+      const owners = await this.claimOwners(hash, ownerUserIds);
+      if (owners.length) fresh.push({ load, hash, ownerUserIds: owners });
+      else skipped++;
+    }
+    if (skipped) this.logger.log(`⏭️ ${skipped} بار تکراری از ${extraction.loads.length} بار رد شد [${label}]`);
+    return fresh;
   }
 
   @Cron('23 * * * *')
@@ -151,8 +214,9 @@ export class CargoPipelineService {
   }
 
   private async saveCargo<T extends CargoMessageRecord>(
-    { label, text, isVoice, entity, record, source, ownerUserIds }: CargoCandidate<T>,
+    { label, text, isVoice, entity, record, source }: CargoCandidate<T>,
     extraction: CargoOrderExtraction,
+    loads: { load: CargoLoad; ownerUserIds: string[] }[],
   ): Promise<void> {
     // ذخیره‌ی رکوردهای بار + ثبت رکوردهای outbox در یه تراکنش واحد -- یا همه
     // انجام می‌شن یا هیچ‌کدوم. match کردن با تنظیمات subscriberها کار
@@ -162,7 +226,9 @@ export class CargoPipelineService {
     const codes = await this.dataSource.transaction(async (manager) => {
       const saved: string[] = [];
 
-      for (const [cargoIndex, load] of extraction.loads.entries()) {
+      // cargoIndex همان جای بار در پیام می‌ماند (بارهای تکراری رد شده‌اند)
+      for (const { load, ownerUserIds } of loads) {
+        const cargoIndex = extraction.loads.indexOf(load);
         const code = await this.nextCargoCode(manager);
         const processedText = buildCargoProcessedText(load, code);
 
