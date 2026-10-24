@@ -1,9 +1,9 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import axios from 'axios';
 import { z } from 'zod';
 import { Injectable } from '@nestjs/common';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
+import { llmChat, LlmChatRequest } from '../common/llmClient';
 
 // ------------------------------------------------------------------
 // Schema خروجی خام مدل -- فقط فیلدهای استخراج‌شده، بدون متن نهایی.
@@ -43,12 +43,12 @@ export type CargoOrderExtraction = z.infer<typeof CargoExtractionSchema>;
 
 @Injectable()
 class TransportOrderService {
-  // صف سراسری فراخوانی مدل -- واتساپ و تلگرام هر دو از همین یک نمونه
+  // صف سراسری مدل محلی -- واتساپ و تلگرام هر دو از همین یک نمونه
   // (CargoDetectionModule) استفاده می‌کنن، پس درخواست‌هاشون به Ollama
-  // پشت‌سرهم اجرا می‌شن، نه هم‌زمان (که باعث timeout می‌شد).
+  // پشت‌سرهم اجرا می‌شن، نه هم‌زمان (که باعث timeout می‌شد). OpenAI صف نداره.
   private readonly modelQueue = new SerialTaskQueue();
 
-  /** تعداد درخواست‌هایی که الان در صف مدل هستن (شامل درخواست در حال اجرا). */
+  /** تعداد درخواست‌هایی که الان در صف مدل محلی هستن (شامل درخواست در حال اجرا). */
   get pendingCount(): number {
     return this.modelQueue.pending;
   }
@@ -57,8 +57,6 @@ class TransportOrderService {
     process.cwd(),
     'src/application/services/agent/prompts/selector.prompt',
   );
-  private readonly OLLAMA_URL = 'http://localhost:11434/api/chat';
-  private readonly MODEL = 'qwen3:8b';
   // درخواست‌ها پشت‌سرهم اجرا می‌شن، پس این مهلت فقط زمان پردازش خود مدله
   // (حدود ۳۵-۶۰ ثانیه روی این GPU)؛ ۶۰ ثانیه کم بود و پیام‌ها از دست می‌رفتن.
   private readonly REQUEST_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 180000;
@@ -77,23 +75,21 @@ class TransportOrderService {
   }
 
   DetermineTextIsTransportOrder(prompt: string): Promise<CargoOrderExtraction> {
-    return this.modelQueue.run(() => this.runDetection(prompt));
+    return this.runDetection(prompt);
   }
 
   private async runDetection(prompt: string): Promise<CargoOrderExtraction> {
     const systemContent = this.loadSystemPrompt();
 
-    const ollamaReq = {
-      model: this.MODEL,
+    const request: LlmChatRequest = {
       messages: [
         { role: 'system', content: systemContent },
         { role: 'user', content: prompt },
       ],
-      stream: false,
       think: false, // غیرفعال کردن تفکر داخلی -- تقریباً نصف می‌کنه زمان پاسخ رو
       // بعد از ۵ دقیقه بی‌کاری (پیش‌فرض) مدل از حافظه خارج و اولین پیام بعدی با
       // لود دوباره کند می‌شد.
-      keep_alive: '30m',
+      keepAlive: '30m',
       options: {
         num_ctx: this.CONTEXT_LENGTH,
         temperature: 0,
@@ -132,23 +128,11 @@ class TransportOrderService {
         },
         required: ['is_cargo_order', 'confidence', 'found_phone_numbers', 'loads'],
       },
+      timeoutMs: this.REQUEST_TIMEOUT_MS,
     };
 
-    let rawContent: string;
-    try {
-      const resp = await axios.post(this.OLLAMA_URL, ollamaReq, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: this.REQUEST_TIMEOUT_MS,
-      });
-      rawContent = resp.data.message.content;
-    } catch (err) {
-      if (axios.isAxiosError(err)) {
-        throw new Error(
-          `خطا در اتصال به Ollama (${this.OLLAMA_URL}): ${err.message}`,
-        );
-      }
-      throw new Error(`خطای ناشناخته در درخواست به مدل: ${(err as Error).message}`);
-    }
+    // اول OpenAI؛ مدل محلی (اگه LLM_LOCAL_FALLBACK خاموش نباشه) پشت صف
+    const rawContent = await llmChat(request, (task) => this.modelQueue.run(task));
 
     let parsed: unknown;
     try {

@@ -2,11 +2,12 @@ import { Injectable, Logger } from '@nestjs/common';
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
-import { isAbsolute, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
+import { Transcript, transcribeSpeech } from '../common/llmClient';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,10 +65,10 @@ function loadCorrections(): TranscriptCorrection[] {
 }
 
 /**
- * تبدیل پیام صوتی به متن با whisper.cpp (محلی، بدون سرویس خارجی) -- مشترک
- * بین گروه/کانال‌های بار همه‌ی پلتفرم‌ها.
+ * تبدیل پیام صوتی به متن -- مشترک بین گروه/کانال‌های بار همه‌ی پلتفرم‌ها. اول OpenAI
+ * (OPENAI_STT_MODEL)، اگه جواب نداد whisper.cpp محلی (یا با LLM_LOCAL_FALLBACK=off، خطا).
  *
- * whisper سنگینه، برای همین درخواست‌ها پشت‌سرهم (نه هم‌زمان) اجرا می‌شن.
+ * whisper سنگینه، برای همین اجراهای محلی پشت‌سرهم (نه هم‌زمان) انجام می‌شن.
  * اگه whisper.cpp با CUDA ساخته شده باشه، خودش از GPU استفاده می‌کنه.
  */
 @Injectable()
@@ -114,7 +115,8 @@ export class SpeechToTextService {
    * تبدیل می‌کنه. اگه گفتاری تشخیص داده نشه، رشته‌ی خالی برمی‌گردونه.
    */
   transcribe(audio: Buffer, extension = 'ogg', overrides: Partial<WhisperOptions> = {}): Promise<string> {
-    return this.queue.run(() => this.runTranscription(audio, extension, { ...this.defaults, ...overrides }));
+    // مدل whisper صریح (ارزیابی مدل‌های محلی با stt:eval) مستقیم محلیه
+    return this.runTranscription(audio, extension, { ...this.defaults, ...overrides }, !!overrides.model);
   }
 
   /**
@@ -139,7 +141,7 @@ export class SpeechToTextService {
     }
   }
 
-  private async runTranscription(audio: Buffer, extension: string, options: WhisperOptions): Promise<string> {
+  private async runTranscription(audio: Buffer, extension: string, options: WhisperOptions, localOnly: boolean): Promise<string> {
     if (options.vad && !this.vadModel) {
       this.logger.warn('مدل VAD پیدا نشد -- بدون VAD ادامه می‌ده (WHISPER_VAD_MODEL رو تنظیم کنید).');
     }
@@ -159,31 +161,20 @@ export class SpeechToTextService {
         { timeout: SpeechToTextService.TIMEOUT_MS },
       );
 
-      const args = ['-m', this.modelPath(options.model), '-f', wavPath, '-l', this.language, '-t', String(this.threads), '-nt', '-np'];
-      if (options.prompt) args.push('--prompt', options.prompt);
-      if (options.vad && this.vadModel) args.push('--vad', '-vm', this.vadModel);
-
       const startedAt = Date.now();
-      const run = (extra: string[]) =>
-        execFileAsync(this.whisperBinary, [...args, ...extra], {
-          timeout: SpeechToTextService.TIMEOUT_MS,
-          maxBuffer: 10 * 1024 * 1024,
-        });
-      // GPU با Ollama (qwen3) مشترکه و حافظه‌اش تنگه -- اگه whisper روی GPU جا
-      // نشد، به‌جای از دست رفتن ویس، روی CPU (کندتر) دوباره اجرا می‌شه.
-      const { stdout } = await run([]).catch((error) => {
-        this.logger.warn(`whisper روی GPU ناموفق بود، اجرا روی CPU: ${(error as Error).message.slice(0, 200)}`);
-        return run(['-ng']);
-      });
+      const local = () => this.queue.run(() => this.runWhisper(wavPath, options));
+      const heard = localOnly
+        ? await local()
+        : await transcribeSpeech(wavPath, { language: this.language, prompt: options.prompt }, local);
 
-      const raw = stdout.split('\n').map((line) => line.trim()).filter(Boolean).join(' ');
+      const raw = heard.text.trim();
       const text = this.corrections.reduce(
         (current, rule) => current.replace(rule.from, rule.to),
         cleanTranscript(raw, options.prompt),
       );
 
-      this.logger.log(`🎙️ تبدیل صدا به متن انجام شد -- ${Date.now() - startedAt}ms`);
-      if (this.sampleDir) await this.keepSample(wavPath, raw, text);
+      this.logger.log(`🎙️ تبدیل صدا به متن انجام شد (${heard.model}) -- ${Date.now() - startedAt}ms`);
+      if (this.sampleDir) await this.keepSample(wavPath, raw, text, heard.model);
       return text;
     } finally {
       await rm(inputPath, { force: true }).catch(() => undefined);
@@ -191,13 +182,32 @@ export class SpeechToTextService {
     }
   }
 
+  private async runWhisper(wavPath: string, options: WhisperOptions): Promise<Transcript> {
+    const args = ['-m', this.modelPath(options.model), '-f', wavPath, '-l', this.language, '-t', String(this.threads), '-nt', '-np'];
+    if (options.prompt) args.push('--prompt', options.prompt);
+    if (options.vad && this.vadModel) args.push('--vad', '-vm', this.vadModel);
+
+    const run = (extra: string[]) =>
+      execFileAsync(this.whisperBinary, [...args, ...extra], {
+        timeout: SpeechToTextService.TIMEOUT_MS,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    // GPU با Ollama (qwen3) مشترکه و حافظه‌اش تنگه -- اگه whisper روی GPU جا
+    // نشد، به‌جای از دست رفتن ویس، روی CPU (کندتر) دوباره اجرا می‌شه.
+    const { stdout } = await run([]).catch((error) => {
+      this.logger.warn(`whisper روی GPU ناموفق بود، اجرا روی CPU: ${(error as Error).message.slice(0, 200)}`);
+      return run(['-ng']);
+    });
+    return { text: stdout.split('\n').map((line) => line.trim()).filter(Boolean).join(' '), model: basename(options.model) };
+  }
+
   /** فایل X.got.txt رو با متن درستِ گفته‌شده به X.txt تغییر نام بدید تا stt:eval اون رو بسنجه. */
-  private async keepSample(wavPath: string, raw: string, text: string): Promise<void> {
+  private async keepSample(wavPath: string, raw: string, text: string, model: string): Promise<void> {
     try {
       await mkdir(this.sampleDir!, { recursive: true });
       const name = join(this.sampleDir!, new Date().toISOString().replace(/[:.]/g, '-'));
       await copyFile(wavPath, `${name}.wav`);
-      await writeFile(`${name}.got.txt`, `raw: ${raw}\nfinal: ${text}\n`);
+      await writeFile(`${name}.got.txt`, `raw: ${raw}\nfinal: ${text}\nmodel: ${model}\n`);
     } catch (error) {
       this.logger.warn(`نمونه‌ی صوتی ذخیره نشد: ${(error as Error).message}`);
     }
