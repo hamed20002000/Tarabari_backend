@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.env
+.env.*
+keys
+uploads
+whatsapp-auth
+test
+coverage
+*.md
+*.log
+tool_embedding_docs.json
