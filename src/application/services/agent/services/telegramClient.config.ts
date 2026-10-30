@@ -1,4 +1,5 @@
 import { TelegramClientParams } from 'telegram/client/telegramBaseClient';
+import { telegramSocksProxy } from '../common/outboundProxy';
 
 export function getTelegramApiCredentials(): { apiId: number; apiHash: string } | null {
   const apiId = Number(process.env.TELEGRAM_API_ID);
@@ -24,5 +25,7 @@ export function buildTelegramClientParams(): TelegramClientParams {
     appVersion: process.env.TELEGRAM_APP_VERSION || '5.6.3 x64',
     langCode: 'fa',
     systemLangCode: 'fa-IR',
+    // روی سرور از پراکسی VPN (OUTBOUND_SOCKS_URL)؛ خالی یعنی مستقیم
+    ...(telegramSocksProxy() && { proxy: telegramSocksProxy() }),
   };
 }

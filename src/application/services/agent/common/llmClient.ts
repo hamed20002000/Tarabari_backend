@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import axios, { AxiosError } from 'axios';
+import { outboundAxios } from './outboundProxy';
 import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 
@@ -152,6 +153,7 @@ async function openAiChat(request: LlmChatRequest, config: OpenAiConfig): Promis
         headers: { Authorization: `Bearer ${config.key}` },
         timeout: wait,
         signal,
+        ...outboundAxios(),
       },
     ));
   let response;
@@ -212,6 +214,7 @@ export async function transcribeSpeech(
           headers: { Authorization: `Bearer ${config.key}` },
           timeout: config.timeoutMs,
           signal,
+          ...outboundAxios(),
         }),
       );
       return { text: response.data?.text ?? '', model: `openai/${config.model}` };
