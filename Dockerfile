@@ -26,13 +26,14 @@ RUN sed -i "s#http://deb.debian.org#${DEBIAN_MIRROR}#g" /etc/apt/sources.list.d/
 ENV NODE_ENV=production TZ=Asia/Tehran
 WORKDIR /app
 # all dependencies stay (dev ones too): migrations run with ts-node
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
 # read at run time from src/: the agent's JSON files and prompts; and the migrations
-COPY --from=build /app/src ./src
-COPY package.json tsconfig.json tsconfig.build.json ./
+COPY --from=build --chown=node:node /app/src ./src
+COPY --chown=node:node package.json tsconfig.json tsconfig.build.json ./
 # .env, keys/, cdn/ (files it serves) and uploads come from the machine (volumes), never from the image
-RUN mkdir -p uploads keys logs cdn && chown -R node:node /app
+# files are copied in as node already: chown -R over node_modules took ~20 minutes and doubled that layer
+RUN mkdir -p uploads keys logs cdn && chown node:node /app uploads keys logs cdn
 USER node
 EXPOSE 3001
 CMD ["node", "dist/main"]
