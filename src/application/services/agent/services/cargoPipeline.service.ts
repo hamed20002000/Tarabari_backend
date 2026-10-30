@@ -3,13 +3,21 @@ import { Cron } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource, DeepPartial, EntityManager, EntityTarget, ObjectLiteral } from 'typeorm';
 import { OutboxEvent } from '../entities/OutboxEvent';
+import { PendingCargoMessage } from '../entities/PendingCargoMessage';
+import { LlmUnavailableError } from '../common/llmClient';
 import { TransportOrderService, CargoOrderExtraction, CargoLoad } from './aiTools.service';
+import { SpeechToTextService } from './speechToText.service';
 import { buildCargoProcessedText } from '../common/cargoText';
 import { cargoLineHashes, cargoLoadHash, cargoTextHash } from '../utils/persianText';
 import { snapPlaceName } from '../utils/placeNames';
 
 // متن تکراری تا این مدت (ساعت) دوباره پردازش و ارسال نمی‌شه.
 const DUPLICATE_WINDOW_HOURS = Number(process.env.CARGO_DUPLICATE_WINDOW_HOURS) || 24;
+// پیامی که چون مدل در دسترس نبود پردازش نشد، تا این مدت (ساعت) دوباره امتحان می‌شه؛ بعدش بار کهنه‌ست.
+const RETRY_MAX_HOURS = Number(process.env.CARGO_RETRY_MAX_HOURS) || 6;
+// هر دقیقه حداکثر این تعداد پیام از صف تلاش دوباره
+const RETRY_BATCH = 20;
+const MINUTE_MS = 60_000;
 
 export interface CargoCandidate<T extends CargoMessageRecord> {
   /** برای لاگ‌ها، مثلاً شناسه‌ی گروه/کانال. */
@@ -27,6 +35,8 @@ export interface CargoCandidate<T extends CargoMessageRecord> {
    * اعلان و نمایش این بار فقط برای همین کاربرهاست.
    */
   ownerUserIds: string[];
+  /** پردازش دوباره از صف (retryPending): خطا به صف برمی‌گرده، نه دوباره به صف اضافه بشه */
+  retry?: boolean;
 }
 
 
@@ -46,11 +56,13 @@ export interface CargoMessageRecord extends ObjectLiteral {
 @Injectable()
 export class CargoPipelineService {
   private readonly logger = new Logger(CargoPipelineService.name);
+  private retrying = false;
 
   constructor(
     private readonly transportOrderService: TransportOrderService,
     @InjectDataSource()
     private readonly dataSource: DataSource,
+    private readonly speech: SpeechToTextService,
   ) { }
 
   /** نتیجه‌ی مدل رو برمی‌گردونه (بار یا غیربار)، یا null اگه پردازش خطا داد. */
@@ -111,9 +123,109 @@ export class CargoPipelineService {
       // پردازش نشد -- پست بعدی همین متن (و بارهایش) نباید تکراری حساب بشه.
       await this.releaseOwners([contentHash], ownerUserIds).catch(() => undefined);
       for (const load of claimedLoads) await this.releaseOwners([load.hash], load.ownerUserIds).catch(() => undefined);
+      if (candidate.retry) throw error;
+      // مدل در دسترس نبود (OpenAI یا VPN قطع): پیام نگه داشته می‌شه تا دوباره امتحان بشه
+      if (error instanceof LlmUnavailableError) await this.enqueueRetry(candidate);
       return null;
     }
   }
+
+  //#region --------------------  صف تلاش دوباره: پیام‌هایی که وقتی مدل در دسترس نبود پردازش نشدن --------------
+
+  /** پیام صوتی که مدل نتونست به متن تبدیلش کنه (VoiceTranscript.unheard): با خود صدا در صف می‌مونه. */
+  async queueVoice<T extends CargoMessageRecord>(candidate: Omit<CargoCandidate<T>, 'text' | 'isVoice'>, audio: Buffer): Promise<void> {
+    await this.enqueueRetry({ ...candidate, text: '', isVoice: true }, audio);
+  }
+
+  private async enqueueRetry<T extends CargoMessageRecord>(candidate: CargoCandidate<T>, audio: Buffer | null = null): Promise<void> {
+    const { label, text, isVoice, entity, record, source, ownerUserIds } = candidate;
+    try {
+      await this.dataSource.getRepository(PendingCargoMessage).save({
+        label,
+        text,
+        audio,
+        isVoice,
+        entityName: this.dataSource.getMetadata(entity).name,
+        record: record as Record<string, unknown>,
+        source,
+        ownerUserIds,
+        nextAttemptAt: new Date(Date.now() + MINUTE_MS),
+      });
+      this.logger.warn(`⏳ مدل در دسترس نیست؛ پیام برای تلاش دوباره نگه داشته شد [${label}]`);
+    } catch (error) {
+      this.logger.error(`نگه داشتن پیام برای تلاش دوباره ناموفق بود [${label}]`, error as Error);
+    }
+  }
+
+  /**
+   * پیام‌های موعدرسیده‌ی صف، قدیمی‌ترین اول. موفق یا تکراری: از صف برداشته می‌شه. باز هم مدل در دسترس نبود: بقیه‌ی
+   * صف این دقیقه امتحان نمی‌شه و هر پیام دیرتر (۱، ۲، ۴ … تا ۳۰ دقیقه) دوباره امتحان می‌شه. کهنه‌تر از
+   * RETRY_MAX_HOURS: کنار گذاشته می‌شه. پیام صوتی اول به متن تبدیل می‌شه.
+   */
+  @Cron('* * * * *')
+  async retryPending(): Promise<void> {
+    if (this.retrying) return;
+    this.retrying = true;
+    const repo = this.dataSource.getRepository(PendingCargoMessage);
+    try {
+      const due = await repo
+        .createQueryBuilder('p')
+        .where('p."nextAttemptAt" <= now()')
+        .orderBy('p."createdAt"', 'ASC')
+        .limit(RETRY_BATCH)
+        .getMany();
+      for (const pending of due) {
+        if (Date.now() - pending.createdAt.getTime() > RETRY_MAX_HOURS * 3_600_000) {
+          await repo.delete({ id: pending.id });
+          this.logger.warn(`🗑️ پیام بعد از ${pending.attempts} تلاش و ${RETRY_MAX_HOURS} ساعت کنار گذاشته شد [${pending.label}]`);
+          continue;
+        }
+        try {
+          // پیام صوتی هنوز تبدیل‌نشده: اول به متن، و متن نگه داشته می‌شه تا دوباره هزینه‌ی تبدیل نده
+          if (pending.audio && !pending.text) {
+            const text = await this.speech.transcribe(pending.audio, 'ogg');
+            if (!text) {
+              await repo.delete({ id: pending.id });
+              this.logger.log(`🔇 پیام صوتی صف گفتاری نداشت [${pending.label}]`);
+              continue;
+            }
+            await repo.update({ id: pending.id }, { text, audio: null });
+            pending.text = text;
+          }
+          await this.process({
+            label: pending.label,
+            text: pending.text,
+            isVoice: pending.isVoice,
+            entity: this.dataSource.getMetadata(pending.entityName).target as EntityTarget<CargoMessageRecord>,
+            record: pending.record as DeepPartial<CargoMessageRecord>,
+            source: pending.source,
+            ownerUserIds: pending.ownerUserIds,
+            retry: true,
+          });
+          await repo.delete({ id: pending.id });
+          this.logger.log(`✅ پیام صف بعد از ${pending.attempts + 1} تلاش پردازش شد [${pending.label}]`);
+        } catch (error) {
+          const attempts = pending.attempts + 1;
+          await repo.update(
+            { id: pending.id },
+            {
+              attempts,
+              nextAttemptAt: new Date(Date.now() + Math.min(2 ** pending.attempts, 30) * MINUTE_MS),
+              lastError: (error as Error).message.slice(0, 500),
+            },
+          );
+          // هنوز قطع است: بقیه‌ی صف همین الان امتحان نمی‌شه
+          if (error instanceof LlmUnavailableError) break;
+        }
+      }
+    } catch (error) {
+      this.logger.error('تلاش دوباره‌ی پیام‌های صف ناموفق بود', error as Error);
+    } finally {
+      this.retrying = false;
+    }
+  }
+
+  //#endregion
 
   /**
    * whisper اسم شهرها رو گاهی آوایی و اشتباه می‌نویسه («تبیز»، «زایدان») --

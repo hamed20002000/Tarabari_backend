@@ -254,24 +254,26 @@ export abstract class AccountChannelMonitor<
 
     this.recentMessageKeys.add(key);//ذخیره کلید پیام در recentMessageKeys تا جلوی پردازش دوباره‌ی پیام‌های غیربارِ تکراری گرفته بشه.
 
-    //#region --------------------   پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه --------------
+    const message = {
+      label,
+      entity: this.messageRepo.target as EntityTarget<M>,
+      record: { chatId, messageId } as DeepPartial<M>,
+      source: { platform: this.platform, chatId },
+      ownerUserIds: channel.ownerUserIds,
+    };
+
+    //#region --------------------   پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه (مدل در دسترس نبود: صدا در صف) --------------
     if (voice) {
-      text = await this.speechToText.transcribeVoice(voice.durationSeconds, voice.download, label);
+      const heard = await this.speechToText.transcribeVoice(voice.durationSeconds, voice.download, label);
+      if (heard.unheard) return this.cargoPipeline.queueVoice(message, heard.unheard);
+      text = heard.text;
       if (!text) return;
     }
     //#endregion ------------------------------------------------------------------------------
 
 
     //#region --------------------   پردازش پیام: تشخیص بار و انتشار event (cargo.message.detected) --------------
-    await this.cargoPipeline.process({
-      label,
-      text,
-      isVoice: !!voice,
-      entity: this.messageRepo.target as EntityTarget<M>,
-      record: { chatId, messageId } as DeepPartial<M>,
-      source: { platform: this.platform, chatId },
-      ownerUserIds: channel.ownerUserIds,
-    });
+    await this.cargoPipeline.process({ ...message, text, isVoice: !!voice });
     //#endregion ------------------------------------------------------------------------------
   }
   //#endregion ------------------------------------------------------------------------------

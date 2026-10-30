@@ -7,7 +7,7 @@ import { cpus } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
 import { SerialTaskQueue } from '../common/serialTaskQueue';
-import { Transcript, transcribeSpeech } from '../common/llmClient';
+import { Transcript, transcribeSpeech, LlmUnavailableError } from '../common/llmClient';
 
 const execFileAsync = promisify(execFile);
 
@@ -71,6 +71,12 @@ function loadCorrections(): TranscriptCorrection[] {
  * whisper سنگینه، برای همین اجراهای محلی پشت‌سرهم (نه هم‌زمان) انجام می‌شن.
  * اگه whisper.cpp با CUDA ساخته شده باشه، خودش از GPU استفاده می‌کنه.
  */
+/** text: متن گفته‌شده ('' یعنی گفتاری نبود)؛ unheard: خود صدا وقتی مدل در دسترس نبود (در صف بمونه و بعداً امتحان بشه). */
+export interface VoiceTranscript {
+  text: string;
+  unheard?: Buffer;
+}
+
 @Injectable()
 export class SpeechToTextService {
   private readonly logger = new Logger(SpeechToTextService.name);
@@ -120,24 +126,27 @@ export class SpeechToTextService {
   }
 
   /**
-   * پیام صوتی یک گروه/کانال: اگه طولانی نباشه دانلود و به متن تبدیل می‌کنه.
-   * اگه طولانی باشه یا هر خطایی رخ بده، رشته‌ی خالی برمی‌گردونه (و لاگ می‌کنه).
+   * پیام صوتی یک گروه/کانال: اگه طولانی نباشه دانلود و به متن تبدیل می‌کنه. اگه مدل در دسترس نبود (OpenAI یا VPN
+   * قطع)، خود صدا در unheard برمی‌گرده تا در صف تلاش دوباره بمونه؛ طولانی یا هر خطای دیگه: متن خالی (و لاگ).
    */
   async transcribeVoice(
     durationSeconds: number,
     download: () => Promise<Buffer>,
     label: string,
-  ): Promise<string> {
+  ): Promise<VoiceTranscript> {
     if (durationSeconds > SpeechToTextService.MAX_DURATION_SECONDS) {
       this.logger.log(`⏭️ پیام صوتی طولانی رد شد (${durationSeconds} ثانیه): ${label}`);
-      return '';
+      return { text: '' };
     }
 
+    let audio: Buffer | undefined;
     try {
-      return await this.transcribe(await download(), 'ogg');
+      audio = await download();
+      return { text: await this.transcribe(audio, 'ogg') };
     } catch (error) {
+      if (audio && error instanceof LlmUnavailableError) return { text: '', unheard: audio };
       this.logger.error(`تبدیل پیام صوتی ناموفق بود: ${label}`, error as Error);
-      return '';
+      return { text: '' };
     }
   }
 

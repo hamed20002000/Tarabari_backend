@@ -13,7 +13,9 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import { Agent as HttpsAgent } from 'https';
+import { outboundAgent, outboundDispatcher } from '../common/outboundProxy';
 import pino from 'pino';
+import { messengerLog } from '../../../../middlewares/logger.service';
 import * as qrcode from 'qrcode-terminal';
 import { WhatsappAuthCredential } from '../entities/WhatsappAuthCredential';
 import { WhatsappAuthKey } from '../entities/WhatsappAuthKey';
@@ -81,6 +83,25 @@ function toJoinError(error: unknown): Error {
   if (status && PERMANENT_JOIN_STATUS[status]) return new WhatsappPermanentJoinError(PERMANENT_JOIN_STATUS[status]);
   return new WhatsappJoinError(`عضویت ناموفق بود: ${message}`);
 }
+
+/** دانلود مدیا با fetch خود Node انجام می‌شه: روی سرور اون هم از پراکسی VPN. */
+const mediaDownloadOptions = () => {
+  const dispatcher = outboundDispatcher();
+  return dispatcher ? { options: { dispatcher } as RequestInit } : {};
+};
+
+/** لاگ خود Baileys (pino) در فایل لاگ واتساپ، نه کنسول. */
+const baileysLog = () => ({
+  write(line: string) {
+    let level = 'warn';
+    try {
+      if (JSON.parse(line).level >= 50) level = 'error';
+    } catch {
+      /* JSON نبود: هشدار حساب می‌شه */
+    }
+    messengerLog('whatsapp').log(level, line.trim(), { context: 'Baileys' });
+  },
+});
 
 @Injectable()
 export class WhatsappService implements OnModuleInit, OnModuleDestroy {
@@ -234,12 +255,14 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
       auth: state,
       // بدون version، نسخه‌ی پیش‌فرض خود Baileys استفاده می‌شه (undefined پیش‌فرض رو خراب می‌کرد).
       ...(version ? { version } : {}),
-      // DNS برای web.whatsapp.com اول IPv6 برمی‌گردونه و روی شبکه‌ی بدون IPv6
-      // وب‌سوکت با ENETUNREACH (کد 408) بسته می‌شد و هیچ‌وقت QR نمی‌اومد.
-      agent: new HttpsAgent({ family: 4 }),
+      // روی سرور از پراکسی VPN (OUTBOUND_PROXY_URL)، آپلود مدیا هم. بدونش: DNS برای
+      // web.whatsapp.com اول IPv6 برمی‌گردونه و روی شبکه‌ی بدون IPv6 وب‌سوکت با
+      // ENETUNREACH (کد 408) بسته می‌شد و هیچ‌وقت QR نمی‌اومد.
+      agent: outboundAgent() ?? new HttpsAgent({ family: 4 }),
+      fetchAgent: outboundAgent(),
       // لاگر پیش‌فرض Baileys سطح info داره و برای هر پیام/رویداد یه خط JSON
       // توی ترمینال چاپ می‌کرد؛ فقط هشدار و خطاهاش نمایش داده می‌شه.
-      logger: pino({ level: process.env.WHATSAPP_LOG_LEVEL || 'warn' }),
+      logger: pino({ level: process.env.WHATSAPP_LOG_LEVEL || 'warn' }, baileysLog()),
       printQRInTerminal: false,
     });
 
@@ -726,30 +749,32 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
 
     this.recentMessageIds.add(messageId);
 
-    // پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه.
+    const message = {
+      label: `${channelJid} ${messageId}`,
+      entity: WhatsappChannelMessage,
+      record: { channelJid, messageId, isCargoOrder: true },
+      source: { platform: 'whatsapp', channelJid },
+      ownerUserIds: channel.ownerUserIds,
+    };
+
+    // پیام صوتی: اول به متن تبدیل می‌شه و بعد مثل پیام متنی بررسی می‌شه؛ اگه مدل در دسترس نبود، صدا در صف می‌مونه.
     const isVoice = !text && !!audio;
     if (isVoice) {
-      text = await this.speechToTextService.transcribeVoice(
+      const heard = await this.speechToTextService.transcribeVoice(
         Number(audio!.seconds ?? 0),
         () =>
-          downloadMediaMessage(msg, 'buffer', {}, {
+          downloadMediaMessage(msg, 'buffer', mediaDownloadOptions(), {
             reuploadRequest: this.sock!.updateMediaMessage,
             logger: this.sock!.logger,
           }),
         `whatsapp ${channelJid} ${messageId}`,
       );
+      if (heard.unheard) return this.cargoPipeline.queueVoice(message, heard.unheard);
+      text = heard.text;
       if (!text) return;
     }
 
-    const extraction = await this.cargoPipeline.process({
-      label: `${channelJid} ${messageId}`,
-      text,
-      isVoice,
-      entity: WhatsappChannelMessage,
-      record: { channelJid, messageId, isCargoOrder: true },
-      source: { platform: 'whatsapp', channelJid },
-      ownerUserIds: channel.ownerUserIds,
-    });
+    const extraction = await this.cargoPipeline.process({ ...message, text, isVoice });
     if (!extraction) return;
 
     // فعلاً غیرفعال -- در این مرحله به صاحب بار/شماره‌های داخل پیام چیزی
