@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
+import { AppLogger } from './middlewares/logger.service';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { Request, Response, NextFunction } from 'express';
@@ -46,7 +47,8 @@ async function bootstrap() {
     process.exit(1);
   });
 
-  const app = await NestFactory.create(AppModule);
+  // لاگ‌ها در فایل جدای هر پیام‌رسان و برنامه (AppLogger)، نه کنسول
+  const app = await NestFactory.create(AppModule, { logger: new AppLogger() });
   const configService = app.get(ConfigService);
 
   // Enable CORS using environment variables
