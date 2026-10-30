@@ -171,6 +171,12 @@ export class WhatsappService implements OnModuleInit, OnModuleDestroy {
   ) { }
 
   async onModuleInit() {
+    // WHATSAPP_ENABLED=off: هیچ‌وقت وصل نمی‌شه -- سیستم توسعه وقتی نشست واتساپ مال سروره (دو اتصال با یک نشست
+    // همدیگه رو بیرون می‌اندازن و تکرارش می‌تونه شماره رو ببنده).
+    if (process.env.WHATSAPP_ENABLED === 'off') {
+      this.logger.warn('واتساپ خاموشه (WHATSAPP_ENABLED=off).');
+      return;
+    }
     // استارت برنامه منتظر واتساپ نمی‌مونه؛ اگه اتصال اول fail بشه، دوباره تلاش می‌شه.
     this.connect().catch((error) => {
       this.logger.error('اتصال به واتساپ ناموفق بود', error as Error);

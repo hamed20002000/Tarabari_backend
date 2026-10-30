@@ -30,10 +30,9 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 # read at run time from src/: the agent's JSON files and prompts; and the migrations
 COPY --from=build /app/src ./src
-COPY --from=build /app/cdn ./cdn
 COPY package.json tsconfig.json tsconfig.build.json ./
-# .env, keys/ and uploads come from the server (volumes), never from the image
-RUN mkdir -p uploads keys logs && chown -R node:node /app
+# .env, keys/, cdn/ (files it serves) and uploads come from the machine (volumes), never from the image
+RUN mkdir -p uploads keys logs cdn && chown -R node:node /app
 USER node
 EXPOSE 3001
 CMD ["node", "dist/main"]
